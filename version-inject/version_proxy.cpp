@@ -8,6 +8,7 @@
 static const DWORD kPlayerBaseAddress = 0x01AC790C;
 static const DWORD kTransparentCallAddress = 0x011499E0;
 static const DWORD kTransparentLoopIntervalMs = 4000;
+static const DWORD kKeyPollIntervalMs = 50;
 
 // 安全读取 DWORD，避免地址无效时导致进程崩溃。
 static DWORD ReadDwordSafely(DWORD address) {
@@ -100,14 +101,34 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 		}
 	}
 
-	// 循环验证透明功能：读取人物指针并调用透明函数。
+	// 循环监听 F1 按键切换透明功能，并按间隔调用透明函数。
+	bool transparent_enabled = false;
+	bool last_key_down = false;
+	ULONGLONG last_call_tick = 0;
 	while (TRUE) {
-		DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
-		if (player_ptr != 0) {
-			CallTransparent(player_ptr);
-			ApplyScorePlaceholder();
+		SHORT key_state = GetAsyncKeyState(VK_F1);
+		bool key_down = (key_state & 0x8000) != 0;
+		if (key_down && !last_key_down) {
+			transparent_enabled = !transparent_enabled;
+			if (transparent_enabled) {
+				last_call_tick = 0;
+			}
 		}
-		Sleep(kTransparentLoopIntervalMs);
+		last_key_down = key_down;
+
+		if (transparent_enabled) {
+			ULONGLONG now = GetTickCount64();
+			if (now - last_call_tick >= kTransparentLoopIntervalMs) {
+				DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
+				if (player_ptr != 0) {
+					CallTransparent(player_ptr);
+					ApplyScorePlaceholder();
+				}
+				last_call_tick = now;
+			}
+		}
+
+		Sleep(kKeyPollIntervalMs);
 	}
 	return 0;
 }
