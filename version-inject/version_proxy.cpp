@@ -8,7 +8,10 @@
 static const DWORD kPlayerBaseAddress = 0x01AC790C;
 static const DWORD kTransparentCallAddress = 0x011499E0;
 static const DWORD kTransparentLoopIntervalMs = 4000;
-static const DWORD kKeyPollIntervalMs = 50;
+
+static BOOL g_auto_transparent_enabled = FALSE;
+static HANDLE g_transparent_thread = NULL;
+static BOOL g_character_transparent = FALSE;
 
 // 安全读取 DWORD，避免地址无效时导致进程崩溃。
 static DWORD ReadDwordSafely(DWORD address) {
@@ -22,6 +25,24 @@ static DWORD ReadDwordSafely(DWORD address) {
 // 评分相关暂未提供基址，保留占位实现，避免写入未知地址。
 static void ApplyScorePlaceholder() {
 	// 评分基址未提供，当前不做任何内存写入，确保稳定性。
+}
+
+// 特效占位逻辑，保持接口一致。
+static void ApplyEffectPlaceholder() {
+}
+
+// 系统公告占位逻辑，保持接口一致。
+static void AnnouncePlaceholder(const wchar_t* message) {
+	UNREFERENCED_PARAMETER(message);
+}
+
+// 城镇/ BOSS 房判断占位逻辑，后续接入实际基址。
+static BOOL IsInTownPlaceholder() {
+	return FALSE;
+}
+
+static BOOL IsInBossRoomPlaceholder() {
+	return FALSE;
 }
 
 // 透明调用实现：参数/调用约定与旧逻辑保持一致。
@@ -83,6 +104,95 @@ static void WriteSuccessFile(const wchar_t* directory_path) {
 	CloseHandle(file);
 }
 
+// 自动透明线程：复刻旧逻辑的状态机与节奏。
+static DWORD WINAPI TransparentThread(LPVOID param) {
+	UNREFERENCED_PARAMETER(param);
+	int effect_state = 0;
+	while (TRUE) {
+		DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
+		if (player_ptr == 0) {
+			g_character_transparent = FALSE;
+			effect_state = 0;
+			Sleep(1000);
+			continue;
+		}
+
+		if (IsInTownPlaceholder()) {
+			g_character_transparent = FALSE;
+			if (effect_state == 0) {
+				effect_state = 1;
+				ApplyEffectPlaceholder();
+			}
+		} else if (IsInBossRoomPlaceholder()) {
+			g_character_transparent = FALSE;
+		} else if (g_character_transparent == FALSE) {
+			g_character_transparent = TRUE;
+			CallTransparent(player_ptr);
+			Sleep(500);
+			ApplyScorePlaceholder();
+			Sleep(500);
+		}
+
+		Sleep(kTransparentLoopIntervalMs);
+	}
+	return 0;
+}
+
+// 尝试解除透明状态，无法保证一定生效，仅做最佳努力。
+static void TryClearTransparentState() {
+	DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
+	if (player_ptr != 0) {
+		CallTransparent(player_ptr);
+	}
+	g_character_transparent = FALSE;
+}
+
+// 自动透明开关：对齐旧逻辑（开启/关闭线程）。
+static void ToggleAutoTransparent() {
+	if (g_auto_transparent_enabled == TRUE) {
+		AnnouncePlaceholder(L"关闭自动透明");
+		g_auto_transparent_enabled = FALSE;
+		TryClearTransparentState();
+		if (g_transparent_thread != NULL) {
+			SuspendThread(g_transparent_thread);
+			SetThreadPriority(g_transparent_thread, THREAD_PRIORITY_IDLE);
+		}
+		return;
+	}
+
+	g_character_transparent = FALSE;
+	if (g_transparent_thread == NULL) {
+		g_transparent_thread = CreateThread(NULL, 0, TransparentThread, NULL, 0, NULL);
+		if (g_transparent_thread == NULL) {
+			return;
+		}
+	} else {
+		ResumeThread(g_transparent_thread);
+	}
+	g_auto_transparent_enabled = TRUE;
+	AnnouncePlaceholder(L"开启自动透明");
+}
+
+// F2 热键消息循环：触发自动透明开关。
+static DWORD WINAPI HotkeyThread(LPVOID param) {
+	UNREFERENCED_PARAMETER(param);
+	if (!RegisterHotKey(NULL, 1, 0, VK_F2)) {
+		return 0;
+	}
+
+	MSG msg = {0};
+	while (GetMessage(&msg, NULL, 0, 0) > 0) {
+		if (msg.message == WM_HOTKEY && msg.wParam == 1) {
+			if (LOWORD(msg.lParam) == 0 && HIWORD(msg.lParam) == VK_F2) {
+				ToggleAutoTransparent();
+			}
+		}
+	}
+
+	UnregisterHotKey(NULL, 1);
+	return 0;
+}
+
 // 在独立线程中执行初始化与循环，避免在 DllMain 中做阻塞或复杂操作。
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
@@ -101,34 +211,9 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 		}
 	}
 
-	// 循环监听 F1 按键切换透明功能，并按间隔调用透明函数。
-	bool transparent_enabled = false;
-	bool last_key_down = false;
-	ULONGLONG last_call_tick = 0;
-	while (TRUE) {
-		SHORT key_state = GetAsyncKeyState(VK_F1);
-		bool key_down = (key_state & 0x8000) != 0;
-		if (key_down && !last_key_down) {
-			transparent_enabled = !transparent_enabled;
-			if (transparent_enabled) {
-				last_call_tick = 0;
-			}
-		}
-		last_key_down = key_down;
-
-		if (transparent_enabled) {
-			ULONGLONG now = GetTickCount64();
-			if (now - last_call_tick >= kTransparentLoopIntervalMs) {
-				DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
-				if (player_ptr != 0) {
-					CallTransparent(player_ptr);
-					ApplyScorePlaceholder();
-				}
-				last_call_tick = now;
-			}
-		}
-
-		Sleep(kKeyPollIntervalMs);
+	HANDLE hotkey_thread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
+	if (hotkey_thread != NULL) {
+		CloseHandle(hotkey_thread);
 	}
 	return 0;
 }
