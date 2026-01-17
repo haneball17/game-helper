@@ -10,14 +10,23 @@
 // 人物基址
 static const DWORD kPlayerBaseAddress = 0x01AC790C;
 
+// 全屏攻击补丁地址
+static const DWORD kFullScreenAttackPatchAddress = 0x00825282;
+
 // 透明调用地址
 static const DWORD kTransparentCallAddress = 0x011499E0;
 
+// // 0625人物基址
+// static const DWORD kPlayerBaseAddress = 0x01AB7CDC;
+
+// // 0625透明调用地址
+// static const DWORD kTransparentCallAddress = 0x0113F400;
+
+// // 0625全屏攻击补丁地址
+// static const DWORD kFullScreenAttackPatchAddress = 0x0081A892;
+
 // 透明循环间隔
 static const DWORD kTransparentLoopIntervalMs = 4000;
-
-// 全屏攻击补丁地址
-static const DWORD kFullScreenAttackPatchAddress = 0x00825282;
 
 // 全屏攻击补丁大小
 static const SIZE_T kFullscreenAttackPatchSize = 2;

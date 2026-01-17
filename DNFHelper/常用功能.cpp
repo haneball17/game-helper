@@ -26,7 +26,7 @@ void 透明call(int 人物)
 		push 0x01
 		mov edx, call地址
 		call edx
-	}
+	}e'd
 	VMEND
 }
 
