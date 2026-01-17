@@ -45,18 +45,27 @@ static const DWORD kInputPollIntervalMs = 30;
 static const DWORD kMapOffset = 0xB8;
 static const DWORD kMapStartOffset = 0xB0;
 static const DWORD kMapEndOffset = 0xB4;
-static const DWORD kTypeOffset = 0x94;
+static const DWORD kTypeOffset = 0x90;
 static const DWORD kPositionXOffset = 0x18C;
 static const DWORD kPositionYOffset = 0x190;
+// 对象坐标指针与子偏移
+static const DWORD kObjectPositionBaseOffset = 0xA8;
+static const DWORD kObjectPositionXOffset = 0x0C;
+static const DWORD kObjectPositionYOffset = 0x10;
+// 阵营偏移
+static const DWORD kFactionOffset = 0x644;
 static const int kTypeItem = 289;
 static const int kTypeMonster = 529;
-static const int kTypeMonsterBuilding = 545;
 static const int kTypeApc = 273;
 static const int kMaxObjectCount = 8192;
 static const int kAttractBurstCount = 15;
 static const DWORD kAttractBurstIntervalMs = 20;
+static const DWORD kAttractLoopIntervalMs = 50;
+static const DWORD kAttractIdleIntervalMs = 200;
 
 static BOOL g_auto_transparent_enabled = FALSE;
+// 自动吸怪开关
+static BOOL g_auto_attract_enabled = FALSE;
 // 透明线程
 static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
@@ -238,16 +247,26 @@ static void AttractMonstersAndItems() {
 	}
 	float player_x = ReadFloatSafely(player_ptr + kPositionXOffset);
 	float player_y = ReadFloatSafely(player_ptr + kPositionYOffset);
-	for (int i = 1; i <= count; i++) {
-		DWORD object_ptr = ReadDwordSafely(start_ptr + 4 * i);
+	// 以 end 为结束地址，按指针步进遍历对象
+	for (DWORD cursor = start_ptr; cursor < end_ptr; cursor += 4) {
+		DWORD object_ptr = ReadDwordSafely(cursor);
 		if (object_ptr == 0 || object_ptr == player_ptr) {
 			continue;
 		}
 		int type = (int)ReadDwordSafely(object_ptr + kTypeOffset);
-		if (type == kTypeMonster || type == kTypeMonsterBuilding || type == kTypeApc || type == kTypeItem) {
-			WriteFloatSafely(object_ptr + kPositionXOffset, player_x);
-			WriteFloatSafely(object_ptr + kPositionYOffset, player_y);
+		if (type != kTypeMonster && type != kTypeApc && type != kTypeItem) {
+			continue;
 		}
+		int faction = (int)ReadDwordSafely(object_ptr + kFactionOffset);
+		if (faction == 0) {
+			continue;
+		}
+		DWORD position_ptr = ReadDwordSafely(object_ptr + kObjectPositionBaseOffset);
+		if (position_ptr == 0) {
+			continue;
+		}
+		WriteFloatSafely(position_ptr + kObjectPositionXOffset, player_x);
+		WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
 	}
 }
 
@@ -261,8 +280,23 @@ static void AttractMonstersAndItemsBurst() {
 	}
 }
 
+// 自动吸怪线程：开启时按固定间隔执行吸怪逻辑。
+static DWORD WINAPI AutoAttractThread(LPVOID param) {
+	UNREFERENCED_PARAMETER(param);
+	while (TRUE) {
+		if (g_auto_attract_enabled == TRUE) {
+			AttractMonstersAndItems();
+			Sleep(kAttractLoopIntervalMs);
+		} else {
+			Sleep(kAttractIdleIntervalMs);
+		}
+	}
+	return 0;
+}
+
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
+static void ToggleAutoAttract();
 
 static DWORD WINAPI InputPollThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
@@ -270,6 +304,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 	bool f2_last_down = false;
 	bool f3_last_down = false;
 	bool f4_last_down = false;
+	bool end_last_down = false;
 	while (TRUE) {
 		HWND foreground = GetForegroundWindow();
 		DWORD foreground_pid = 0;
@@ -280,9 +315,11 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			SHORT f2_state = GetAsyncKeyState(VK_F2);
 			SHORT f3_state = GetAsyncKeyState(VK_F3);
 			SHORT f4_state = GetAsyncKeyState(VK_F4);
+			SHORT end_state = GetAsyncKeyState(VK_END);
 			bool f2_down = (f2_state & 0x8000) != 0;
 			bool f3_down = (f3_state & 0x8000) != 0;
 			bool f4_down = (f4_state & 0x8000) != 0;
+			bool end_down = (end_state & 0x8000) != 0;
 			if (f2_down && !f2_last_down) {
 				ToggleAutoTransparent();
 			}
@@ -292,13 +329,18 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			if (f4_down && !f4_last_down) {
 				AttractMonstersAndItemsBurst();
 			}
+			if (end_down && !end_last_down) {
+				ToggleAutoAttract();
+			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
 			f4_last_down = f4_down;
+			end_last_down = end_down;
 		} else {
 			f2_last_down = false;
 			f3_last_down = false;
 			f4_last_down = false;
+			end_last_down = false;
 		}
 		Sleep(kInputPollIntervalMs);
 	}
@@ -433,6 +475,17 @@ static void ToggleAutoTransparent() {
 	AnnouncePlaceholder(L"开启自动透明");
 }
 
+// 自动吸怪开关：常驻线程按开关控制，不做副本状态自动关闭。
+static void ToggleAutoAttract() {
+	if (g_auto_attract_enabled == TRUE) {
+		g_auto_attract_enabled = FALSE;
+		AnnouncePlaceholder(L"关闭自动吸怪");
+		return;
+	}
+	g_auto_attract_enabled = TRUE;
+	AnnouncePlaceholder(L"开启自动吸怪");
+}
+
 // 在独立线程中执行初始化与循环，避免在 DllMain 中做阻塞或复杂操作。
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
@@ -455,6 +508,10 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 	HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
 	if (input_thread != NULL) {
 		CloseHandle(input_thread);
+	}
+	HANDLE attract_thread = CreateThread(NULL, 0, AutoAttractThread, NULL, 0, NULL);
+	if (attract_thread != NULL) {
+		CloseHandle(attract_thread);
 	}
 	return 0;
 }
