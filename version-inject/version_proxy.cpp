@@ -44,6 +44,8 @@ static const int kTypeMonster = 529;
 static const int kTypeMonsterBuilding = 545;
 static const int kTypeApc = 273;
 static const int kMaxObjectCount = 8192;
+static const int kAttractBurstCount = 15;
+static const DWORD kAttractBurstIntervalMs = 20;
 
 static BOOL g_auto_transparent_enabled = FALSE;
 // 透明线程
@@ -240,6 +242,16 @@ static void AttractMonstersAndItems() {
 	}
 }
 
+// 吸怪聚物短时高频写入：抵消游戏对坐标的快速回写。
+static void AttractMonstersAndItemsBurst() {
+	for (int i = 0; i < kAttractBurstCount; i++) {
+		AttractMonstersAndItems();
+		if (i + 1 < kAttractBurstCount) {
+			Sleep(kAttractBurstIntervalMs);
+		}
+	}
+}
+
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
 
@@ -269,7 +281,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 				ToggleFullscreenAttack();
 			}
 			if (f4_down && !f4_last_down) {
-				AttractMonstersAndItems();
+				AttractMonstersAndItemsBurst();
 			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
