@@ -1,6 +1,7 @@
 ﻿#include <windows.h>
 #include <stdio.h>
 #include <wchar.h>
+#include <string.h>
 
 #include "version_exports.h"
 
@@ -8,10 +9,17 @@
 static const DWORD kPlayerBaseAddress = 0x01AC790C;
 static const DWORD kTransparentCallAddress = 0x011499E0;
 static const DWORD kTransparentLoopIntervalMs = 4000;
+static const DWORD kFullScreenAttackPatchAddress = 0x00825282;
+static const SIZE_T kFullscreenAttackPatchSize = 2;
+static const BYTE kFullscreenAttackPatchOffA[kFullscreenAttackPatchSize] = {0x30, 0xC0};
+static const BYTE kFullscreenAttackPatchOffB[kFullscreenAttackPatchSize] = {0x32, 0xC0};
+static const BYTE kFullscreenAttackPatchOn[kFullscreenAttackPatchSize] = {0xB0, 0x01};
 
 static BOOL g_auto_transparent_enabled = FALSE;
 static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
+static BYTE g_fullscreen_attack_off_patch[kFullscreenAttackPatchSize] = {0};
+static BOOL g_fullscreen_attack_off_patch_set = FALSE;
 
 // 安全读取 DWORD，避免地址无效时导致进程崩溃。
 static DWORD ReadDwordSafely(DWORD address) {
@@ -43,6 +51,99 @@ static BOOL IsInTownPlaceholder() {
 
 static BOOL IsInBossRoomPlaceholder() {
 	return FALSE;
+}
+
+// 安全读取字节序列，避免无效地址导致崩溃。
+static BOOL ReadBytesSafely(DWORD address, BYTE* buffer, SIZE_T size) {
+	__try {
+		memcpy(buffer, reinterpret_cast<const void*>(address), size);
+		return TRUE;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return FALSE;
+	}
+}
+
+// 安全写入字节序列，带权限切换与指令缓存刷新。
+static BOOL WriteBytesSafely(DWORD address, const BYTE* buffer, SIZE_T size) {
+	DWORD old_protect = 0;
+	if (!VirtualProtect(reinterpret_cast<void*>(address), size, PAGE_EXECUTE_READWRITE, &old_protect)) {
+		return FALSE;
+	}
+
+	BOOL wrote = FALSE;
+	__try {
+		memcpy(reinterpret_cast<void*>(address), buffer, size);
+		wrote = TRUE;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		wrote = FALSE;
+	}
+
+	DWORD ignored = 0;
+	VirtualProtect(reinterpret_cast<void*>(address), size, old_protect, &ignored);
+	if (wrote) {
+		FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), size);
+	}
+	return wrote;
+}
+
+// 判断是否为“关闭全屏攻击”的指令形态。
+static BOOL IsFullscreenAttackOffBytes(const BYTE* bytes) {
+	return memcmp(bytes, kFullscreenAttackPatchOffA, kFullscreenAttackPatchSize) == 0 ||
+		memcmp(bytes, kFullscreenAttackPatchOffB, kFullscreenAttackPatchSize) == 0;
+}
+
+// 记录当前版本的关闭指令，便于恢复原始形态。
+static void RememberFullscreenAttackOffBytes(const BYTE* bytes) {
+	if (!g_fullscreen_attack_off_patch_set && IsFullscreenAttackOffBytes(bytes)) {
+		memcpy(g_fullscreen_attack_off_patch, bytes, kFullscreenAttackPatchSize);
+		g_fullscreen_attack_off_patch_set = TRUE;
+	}
+}
+
+// 全屏攻击补丁：仅在识别到预期字节时才切换，避免写错版本。
+static BOOL SetFullscreenAttackEnabled(BOOL enabled) {
+	BYTE current[2] = {0};
+	if (!ReadBytesSafely(kFullScreenAttackPatchAddress, current, sizeof(current))) {
+		return FALSE;
+	}
+	RememberFullscreenAttackOffBytes(current);
+	if (enabled == TRUE) {
+		if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) == 0) {
+			return TRUE;
+		}
+		if (!IsFullscreenAttackOffBytes(current)) {
+			return FALSE;
+		}
+		return WriteBytesSafely(kFullScreenAttackPatchAddress, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize);
+	}
+	if (IsFullscreenAttackOffBytes(current)) {
+		return TRUE;
+	}
+	if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) != 0) {
+		return FALSE;
+	}
+	const BYTE* off_patch = g_fullscreen_attack_off_patch_set ? g_fullscreen_attack_off_patch : kFullscreenAttackPatchOffB;
+	return WriteBytesSafely(kFullScreenAttackPatchAddress, off_patch, kFullscreenAttackPatchSize);
+}
+
+static void ToggleFullscreenAttack() {
+	BYTE current[2] = {0};
+	if (!ReadBytesSafely(kFullScreenAttackPatchAddress, current, sizeof(current))) {
+		return;
+	}
+	RememberFullscreenAttackOffBytes(current);
+	if (IsFullscreenAttackOffBytes(current)) {
+		if (SetFullscreenAttackEnabled(TRUE)) {
+			AnnouncePlaceholder(L"开启全屏攻击");
+		}
+		return;
+	}
+	if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) == 0) {
+		if (SetFullscreenAttackEnabled(FALSE)) {
+			AnnouncePlaceholder(L"关闭全屏攻击");
+		}
+		return;
+	}
 }
 
 // 透明调用实现：参数/调用约定与旧逻辑保持一致。
@@ -176,20 +277,34 @@ static void ToggleAutoTransparent() {
 // F2 热键消息循环：触发自动透明开关。
 static DWORD WINAPI HotkeyThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
-	if (!RegisterHotKey(NULL, 1, 0, VK_F2)) {
+	BOOL f2_registered = RegisterHotKey(NULL, 1, 0, VK_F2);
+	BOOL f3_registered = RegisterHotKey(NULL, 2, 0, VK_F3);
+	if (!f2_registered && !f3_registered) {
 		return 0;
 	}
 
 	MSG msg = {0};
 	while (GetMessage(&msg, NULL, 0, 0) > 0) {
-		if (msg.message == WM_HOTKEY && msg.wParam == 1) {
+		if (msg.message != WM_HOTKEY) {
+			continue;
+		}
+		if (msg.wParam == 1) {
 			if (LOWORD(msg.lParam) == 0 && HIWORD(msg.lParam) == VK_F2) {
 				ToggleAutoTransparent();
+			}
+		} else if (msg.wParam == 2) {
+			if (LOWORD(msg.lParam) == 0 && HIWORD(msg.lParam) == VK_F3) {
+				ToggleFullscreenAttack();
 			}
 		}
 	}
 
-	UnregisterHotKey(NULL, 1);
+	if (f2_registered) {
+		UnregisterHotKey(NULL, 1);
+	}
+	if (f3_registered) {
+		UnregisterHotKey(NULL, 2);
+	}
 	return 0;
 }
 
@@ -211,6 +326,7 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 		}
 	}
 
+	SetFullscreenAttackEnabled(FALSE);
 	HANDLE hotkey_thread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
 	if (hotkey_thread != NULL) {
 		CloseHandle(hotkey_thread);
