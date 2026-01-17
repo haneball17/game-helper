@@ -58,14 +58,20 @@ static const int kTypeItem = 289;
 static const int kTypeMonster = 529;
 static const int kTypeApc = 273;
 static const int kMaxObjectCount = 8192;
-static const int kAttractBurstCount = 15;
-static const DWORD kAttractBurstIntervalMs = 20;
 static const DWORD kAttractLoopIntervalMs = 20;
 static const DWORD kAttractIdleIntervalMs = 200;
+static const int kAttractModeOff = 0;
+static const int kAttractModeAllToPlayer = 1;
+static const int kAttractModeMonsterOffset80 = 2;
+static const int kAttractModeMonsterOffset150 = 3;
+static const int kAttractModeMonsterOffset300 = 4;
+static const int kAttractModeMax = 4;
+// 怪物 X 坐标偏移配置（索引为配置模式）
+static const float kMonsterXOffsetByMode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0f, 150.0f, 300.0f};
 
 static BOOL g_auto_transparent_enabled = FALSE;
-// 自动吸怪开关
-static BOOL g_auto_attract_enabled = FALSE;
+// 自动吸怪配置（0 为关闭）
+static int g_attract_mode = kAttractModeOff;
 // 透明线程
 static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
@@ -226,8 +232,11 @@ static void ToggleFullscreenAttack() {
 	}
 }
 
-// 吸怪聚物：遍历对象并把怪物/物品坐标拉到人物坐标。
-static void AttractMonstersAndItems() {
+// 吸怪聚物：根据配置把怪物/物品坐标拉到人物坐标或偏移位置。
+static void AttractMonstersAndItems(int mode) {
+	if (mode <= kAttractModeOff || mode > kAttractModeMax) {
+		return;
+	}
 	DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
 	if (player_ptr == 0) {
 		return;
@@ -247,6 +256,7 @@ static void AttractMonstersAndItems() {
 	}
 	float player_x = ReadFloatSafely(player_ptr + kPositionXOffset);
 	float player_y = ReadFloatSafely(player_ptr + kPositionYOffset);
+	float monster_x = player_x + kMonsterXOffsetByMode[mode];
 	// 以 end 为结束地址，按指针步进遍历对象
 	for (DWORD cursor = start_ptr; cursor < end_ptr; cursor += 4) {
 		DWORD object_ptr = ReadDwordSafely(cursor);
@@ -271,19 +281,9 @@ static void AttractMonstersAndItems() {
 			WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
 			continue;
 		}
-		// 怪物/敌对 APC 的 X 坐标调整到人物 X + 150，Y 坐标与人物一致。
-		WriteFloatSafely(position_ptr + kObjectPositionXOffset, player_x + 150.0f);
+		// 怪物/敌对 APC 的 X 坐标按配置偏移，Y 坐标与人物一致。
+		WriteFloatSafely(position_ptr + kObjectPositionXOffset, monster_x);
 		WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
-	}
-}
-
-// 吸怪聚物短时高频写入：抵消游戏对坐标的快速回写。
-static void AttractMonstersAndItemsBurst() {
-	for (int i = 0; i < kAttractBurstCount; i++) {
-		AttractMonstersAndItems();
-		if (i + 1 < kAttractBurstCount) {
-			Sleep(kAttractBurstIntervalMs);
-		}
 	}
 }
 
@@ -291,8 +291,9 @@ static void AttractMonstersAndItemsBurst() {
 static DWORD WINAPI AutoAttractThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
 	while (TRUE) {
-		if (g_auto_attract_enabled == TRUE) {
-			AttractMonstersAndItems();
+		int mode = g_attract_mode;
+		if (mode != kAttractModeOff) {
+			AttractMonstersAndItems(mode);
 			Sleep(kAttractLoopIntervalMs);
 		} else {
 			Sleep(kAttractIdleIntervalMs);
@@ -303,15 +304,17 @@ static DWORD WINAPI AutoAttractThread(LPVOID param) {
 
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
-static void ToggleAutoAttract();
+static void ToggleAttractMode(int mode, const wchar_t* message);
 
 static DWORD WINAPI InputPollThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
 	DWORD self_pid = GetCurrentProcessId();
 	bool f2_last_down = false;
 	bool f3_last_down = false;
-	bool f4_last_down = false;
-	bool end_last_down = false;
+	bool key7_last_down = false;
+	bool key8_last_down = false;
+	bool key9_last_down = false;
+	bool key0_last_down = false;
 	while (TRUE) {
 		HWND foreground = GetForegroundWindow();
 		DWORD foreground_pid = 0;
@@ -321,33 +324,47 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 		if (foreground_pid == self_pid) {
 			SHORT f2_state = GetAsyncKeyState(VK_F2);
 			SHORT f3_state = GetAsyncKeyState(VK_F3);
-			SHORT f4_state = GetAsyncKeyState(VK_F4);
-			SHORT end_state = GetAsyncKeyState(VK_END);
+			SHORT key7_state = GetAsyncKeyState('7');
+			SHORT key8_state = GetAsyncKeyState('8');
+			SHORT key9_state = GetAsyncKeyState('9');
+			SHORT key0_state = GetAsyncKeyState('0');
 			bool f2_down = (f2_state & 0x8000) != 0;
 			bool f3_down = (f3_state & 0x8000) != 0;
-			bool f4_down = (f4_state & 0x8000) != 0;
-			bool end_down = (end_state & 0x8000) != 0;
+			bool key7_down = (key7_state & 0x8000) != 0;
+			bool key8_down = (key8_state & 0x8000) != 0;
+			bool key9_down = (key9_state & 0x8000) != 0;
+			bool key0_down = (key0_state & 0x8000) != 0;
 			if (f2_down && !f2_last_down) {
 				ToggleAutoTransparent();
 			}
 			if (f3_down && !f3_last_down) {
 				ToggleFullscreenAttack();
 			}
-			if (f4_down && !f4_last_down) {
-				AttractMonstersAndItemsBurst();
+			if (key7_down && !key7_last_down) {
+				ToggleAttractMode(kAttractModeAllToPlayer, L"开启吸怪配置1");
 			}
-			if (end_down && !end_last_down) {
-				ToggleAutoAttract();
+			if (key8_down && !key8_last_down) {
+				ToggleAttractMode(kAttractModeMonsterOffset80, L"开启吸怪配置2");
+			}
+			if (key9_down && !key9_last_down) {
+				ToggleAttractMode(kAttractModeMonsterOffset150, L"开启吸怪配置3");
+			}
+			if (key0_down && !key0_last_down) {
+				ToggleAttractMode(kAttractModeMonsterOffset300, L"开启吸怪配置4");
 			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
-			f4_last_down = f4_down;
-			end_last_down = end_down;
+			key7_last_down = key7_down;
+			key8_last_down = key8_down;
+			key9_last_down = key9_down;
+			key0_last_down = key0_down;
 		} else {
 			f2_last_down = false;
 			f3_last_down = false;
-			f4_last_down = false;
-			end_last_down = false;
+			key7_last_down = false;
+			key8_last_down = false;
+			key9_last_down = false;
+			key0_last_down = false;
 		}
 		Sleep(kInputPollIntervalMs);
 	}
@@ -482,15 +499,20 @@ static void ToggleAutoTransparent() {
 	AnnouncePlaceholder(L"开启自动透明");
 }
 
-// 自动吸怪开关：常驻线程按开关控制，不做副本状态自动关闭。
-static void ToggleAutoAttract() {
-	if (g_auto_attract_enabled == TRUE) {
-		g_auto_attract_enabled = FALSE;
-		AnnouncePlaceholder(L"关闭自动吸怪");
+// 自动吸怪切换：相同配置再次触发则关闭。
+static void ToggleAttractMode(int mode, const wchar_t* message) {
+	if (mode <= kAttractModeOff || mode > kAttractModeMax) {
 		return;
 	}
-	g_auto_attract_enabled = TRUE;
-	AnnouncePlaceholder(L"开启自动吸怪");
+	if (g_attract_mode == mode) {
+		g_attract_mode = kAttractModeOff;
+		AnnouncePlaceholder(L"关闭吸怪聚物");
+		return;
+	}
+	g_attract_mode = mode;
+	if (message != NULL) {
+		AnnouncePlaceholder(message);
+	}
 }
 
 // 在独立线程中执行初始化与循环，避免在 DllMain 中做阻塞或复杂操作。
