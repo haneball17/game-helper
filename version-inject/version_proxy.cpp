@@ -6,16 +6,35 @@
 #include "version_exports.h"
 
 // 透明功能的绝对地址配置（x86）。
+
+// 人物基址
 static const DWORD kPlayerBaseAddress = 0x01AC790C;
+
+// 透明调用地址
 static const DWORD kTransparentCallAddress = 0x011499E0;
+
+// 透明循环间隔
 static const DWORD kTransparentLoopIntervalMs = 4000;
+
+// 全屏攻击补丁地址
 static const DWORD kFullScreenAttackPatchAddress = 0x00825282;
+
+// 全屏攻击补丁大小
 static const SIZE_T kFullscreenAttackPatchSize = 2;
-static const BYTE kFullscreenAttackPatchOffA[kFullscreenAttackPatchSize] = {0x30, 0xC0};
-static const BYTE kFullscreenAttackPatchOffB[kFullscreenAttackPatchSize] = {0x32, 0xC0};
+
+// 全屏攻击补丁关闭
+static const BYTE kFullscreenAttackPatchOff[kFullscreenAttackPatchSize] = {0x32, 0xC0};
+
+// static const BYTE kFullscreenAttackPatchOffB[kFullscreenAttackPatchSize] = {0x30, 0xC0};
+
+// 全屏攻击补丁开启
 static const BYTE kFullscreenAttackPatchOn[kFullscreenAttackPatchSize] = {0xB0, 0x01};
 
+// 输入轮询间隔
+static const DWORD kInputPollIntervalMs = 30;
+
 static BOOL g_auto_transparent_enabled = FALSE;
+// 透明线程
 static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
 static BYTE g_fullscreen_attack_off_patch[kFullscreenAttackPatchSize] = {0};
@@ -88,8 +107,7 @@ static BOOL WriteBytesSafely(DWORD address, const BYTE* buffer, SIZE_T size) {
 
 // 判断是否为“关闭全屏攻击”的指令形态。
 static BOOL IsFullscreenAttackOffBytes(const BYTE* bytes) {
-	return memcmp(bytes, kFullscreenAttackPatchOffA, kFullscreenAttackPatchSize) == 0 ||
-		memcmp(bytes, kFullscreenAttackPatchOffB, kFullscreenAttackPatchSize) == 0;
+	return memcmp(bytes, kFullscreenAttackPatchOff, kFullscreenAttackPatchSize) == 0 ;
 }
 
 // 记录当前版本的关闭指令，便于恢复原始形态。
@@ -122,7 +140,7 @@ static BOOL SetFullscreenAttackEnabled(BOOL enabled) {
 	if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) != 0) {
 		return FALSE;
 	}
-	const BYTE* off_patch = g_fullscreen_attack_off_patch_set ? g_fullscreen_attack_off_patch : kFullscreenAttackPatchOffB;
+	const BYTE* off_patch = g_fullscreen_attack_off_patch_set ? g_fullscreen_attack_off_patch : kFullscreenAttackPatchOff;
 	return WriteBytesSafely(kFullScreenAttackPatchAddress, off_patch, kFullscreenAttackPatchSize);
 }
 
@@ -144,6 +162,42 @@ static void ToggleFullscreenAttack() {
 		}
 		return;
 	}
+}
+
+// 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
+static void ToggleAutoTransparent();
+
+static DWORD WINAPI InputPollThread(LPVOID param) {
+	UNREFERENCED_PARAMETER(param);
+	DWORD self_pid = GetCurrentProcessId();
+	bool f2_last_down = false;
+	bool f3_last_down = false;
+	while (TRUE) {
+		HWND foreground = GetForegroundWindow();
+		DWORD foreground_pid = 0;
+		if (foreground != NULL) {
+			GetWindowThreadProcessId(foreground, &foreground_pid);
+		}
+		if (foreground_pid == self_pid) {
+			SHORT f2_state = GetAsyncKeyState(VK_F2);
+			SHORT f3_state = GetAsyncKeyState(VK_F3);
+			bool f2_down = (f2_state & 0x8000) != 0;
+			bool f3_down = (f3_state & 0x8000) != 0;
+			if (f2_down && !f2_last_down) {
+				ToggleAutoTransparent();
+			}
+			if (f3_down && !f3_last_down) {
+				ToggleFullscreenAttack();
+			}
+			f2_last_down = f2_down;
+			f3_last_down = f3_down;
+		} else {
+			f2_last_down = false;
+			f3_last_down = false;
+		}
+		Sleep(kInputPollIntervalMs);
+	}
+	return 0;
 }
 
 // 透明调用实现：参数/调用约定与旧逻辑保持一致。
@@ -275,39 +329,6 @@ static void ToggleAutoTransparent() {
 }
 
 // F2 热键消息循环：触发自动透明开关。
-static DWORD WINAPI HotkeyThread(LPVOID param) {
-	UNREFERENCED_PARAMETER(param);
-	BOOL f2_registered = RegisterHotKey(NULL, 1, 0, VK_F2);
-	BOOL f3_registered = RegisterHotKey(NULL, 2, 0, VK_F3);
-	if (!f2_registered && !f3_registered) {
-		return 0;
-	}
-
-	MSG msg = {0};
-	while (GetMessage(&msg, NULL, 0, 0) > 0) {
-		if (msg.message != WM_HOTKEY) {
-			continue;
-		}
-		if (msg.wParam == 1) {
-			if (LOWORD(msg.lParam) == 0 && HIWORD(msg.lParam) == VK_F2) {
-				ToggleAutoTransparent();
-			}
-		} else if (msg.wParam == 2) {
-			if (LOWORD(msg.lParam) == 0 && HIWORD(msg.lParam) == VK_F3) {
-				ToggleFullscreenAttack();
-			}
-		}
-	}
-
-	if (f2_registered) {
-		UnregisterHotKey(NULL, 1);
-	}
-	if (f3_registered) {
-		UnregisterHotKey(NULL, 2);
-	}
-	return 0;
-}
-
 // 在独立线程中执行初始化与循环，避免在 DllMain 中做阻塞或复杂操作。
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
@@ -327,9 +348,9 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 	}
 
 	SetFullscreenAttackEnabled(FALSE);
-	HANDLE hotkey_thread = CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
-	if (hotkey_thread != NULL) {
-		CloseHandle(hotkey_thread);
+	HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
+	if (input_thread != NULL) {
+		CloseHandle(input_thread);
 	}
 	return 0;
 }
