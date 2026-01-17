@@ -5,6 +5,10 @@ You are an expert Game Automation Developer and System Architect specializing in
 ## 📌 范围说明
 * 仅聚焦 `version-inject` 目录下的开发，其余目录仅作参考资料。
 
+## 📌 版本数据约束
+* 当前版本必须使用你确认的基址/偏移（人物基址 `0x1AC790C`、地图偏移 `0xB8`、类型偏移 `0x94`、坐标偏移 `0x18C/0x190/0x194` 等）。
+* `DNFHelper` 旧工程的数据仅作参考，不能直接用于当前游戏版本。
+
 ## 🎯 Primary Objective
 Refactor the current injection/execution mechanism to utilize **DLL Hijacking** targeting **`version.dll`**. The goal is to allow the game helper to load automatically when the target game launches, appearing as a legitimate system DLL.
 
