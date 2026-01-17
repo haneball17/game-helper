@@ -23,15 +23,27 @@ static const DWORD kFullScreenAttackPatchAddress = 0x00825282;
 static const SIZE_T kFullscreenAttackPatchSize = 2;
 
 // 全屏攻击补丁关闭
-static const BYTE kFullscreenAttackPatchOff[kFullscreenAttackPatchSize] = {0x32, 0xC0};
-
-// static const BYTE kFullscreenAttackPatchOffB[kFullscreenAttackPatchSize] = {0x30, 0xC0};
+static const BYTE kFullscreenAttackPatchOffA[kFullscreenAttackPatchSize] = {0x30, 0xC0};
+static const BYTE kFullscreenAttackPatchOffB[kFullscreenAttackPatchSize] = {0x32, 0xC0};
 
 // 全屏攻击补丁开启
 static const BYTE kFullscreenAttackPatchOn[kFullscreenAttackPatchSize] = {0xB0, 0x01};
 
 // 输入轮询间隔
 static const DWORD kInputPollIntervalMs = 30;
+
+// 地图与对象偏移
+static const DWORD kMapOffset = 0xB8;
+static const DWORD kMapStartOffset = 0xB0;
+static const DWORD kMapEndOffset = 0xB4;
+static const DWORD kTypeOffset = 0x94;
+static const DWORD kPositionXOffset = 0x18C;
+static const DWORD kPositionYOffset = 0x190;
+static const int kTypeItem = 289;
+static const int kTypeMonster = 529;
+static const int kTypeMonsterBuilding = 545;
+static const int kTypeApc = 273;
+static const int kMaxObjectCount = 8192;
 
 static BOOL g_auto_transparent_enabled = FALSE;
 // 透明线程
@@ -47,6 +59,35 @@ static DWORD ReadDwordSafely(DWORD address) {
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
 		return 0;
 	}
+}
+
+// 安全读取 float，避免地址无效时导致进程崩溃。
+static float ReadFloatSafely(DWORD address) {
+	__try {
+		return *(float*)address;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0.0f;
+	}
+}
+
+// 安全写入 float，带权限切换。
+static BOOL WriteFloatSafely(DWORD address, float value) {
+	DWORD old_protect = 0;
+	if (!VirtualProtect(reinterpret_cast<void*>(address), sizeof(float), PAGE_EXECUTE_READWRITE, &old_protect)) {
+		return FALSE;
+	}
+
+	BOOL wrote = FALSE;
+	__try {
+		*(float*)address = value;
+		wrote = TRUE;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		wrote = FALSE;
+	}
+
+	DWORD ignored = 0;
+	VirtualProtect(reinterpret_cast<void*>(address), sizeof(float), old_protect, &ignored);
+	return wrote;
 }
 
 // 评分相关暂未提供基址，保留占位实现，避免写入未知地址。
@@ -107,7 +148,8 @@ static BOOL WriteBytesSafely(DWORD address, const BYTE* buffer, SIZE_T size) {
 
 // 判断是否为“关闭全屏攻击”的指令形态。
 static BOOL IsFullscreenAttackOffBytes(const BYTE* bytes) {
-	return memcmp(bytes, kFullscreenAttackPatchOff, kFullscreenAttackPatchSize) == 0 ;
+	return memcmp(bytes, kFullscreenAttackPatchOffA, kFullscreenAttackPatchSize) == 0 ||
+		memcmp(bytes, kFullscreenAttackPatchOffB, kFullscreenAttackPatchSize) == 0;
 }
 
 // 记录当前版本的关闭指令，便于恢复原始形态。
@@ -140,7 +182,7 @@ static BOOL SetFullscreenAttackEnabled(BOOL enabled) {
 	if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) != 0) {
 		return FALSE;
 	}
-	const BYTE* off_patch = g_fullscreen_attack_off_patch_set ? g_fullscreen_attack_off_patch : kFullscreenAttackPatchOff;
+	const BYTE* off_patch = g_fullscreen_attack_off_patch_set ? g_fullscreen_attack_off_patch : kFullscreenAttackPatchOffB;
 	return WriteBytesSafely(kFullScreenAttackPatchAddress, off_patch, kFullscreenAttackPatchSize);
 }
 
@@ -164,6 +206,40 @@ static void ToggleFullscreenAttack() {
 	}
 }
 
+// 吸怪聚物：遍历对象并把怪物/物品坐标拉到人物坐标。
+static void AttractMonstersAndItems() {
+	DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
+	if (player_ptr == 0) {
+		return;
+	}
+	DWORD map_ptr = ReadDwordSafely(player_ptr + kMapOffset);
+	if (map_ptr == 0) {
+		return;
+	}
+	DWORD start_ptr = ReadDwordSafely(map_ptr + kMapStartOffset);
+	DWORD end_ptr = ReadDwordSafely(map_ptr + kMapEndOffset);
+	if (start_ptr == 0 || end_ptr == 0 || end_ptr <= start_ptr) {
+		return;
+	}
+	int count = (int)((end_ptr - start_ptr) / 4);
+	if (count <= 0 || count > kMaxObjectCount) {
+		return;
+	}
+	float player_x = ReadFloatSafely(player_ptr + kPositionXOffset);
+	float player_y = ReadFloatSafely(player_ptr + kPositionYOffset);
+	for (int i = 1; i <= count; i++) {
+		DWORD object_ptr = ReadDwordSafely(start_ptr + 4 * i);
+		if (object_ptr == 0 || object_ptr == player_ptr) {
+			continue;
+		}
+		int type = (int)ReadDwordSafely(object_ptr + kTypeOffset);
+		if (type == kTypeMonster || type == kTypeMonsterBuilding || type == kTypeApc || type == kTypeItem) {
+			WriteFloatSafely(object_ptr + kPositionXOffset, player_x);
+			WriteFloatSafely(object_ptr + kPositionYOffset, player_y);
+		}
+	}
+}
+
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
 
@@ -172,6 +248,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 	DWORD self_pid = GetCurrentProcessId();
 	bool f2_last_down = false;
 	bool f3_last_down = false;
+	bool f4_last_down = false;
 	while (TRUE) {
 		HWND foreground = GetForegroundWindow();
 		DWORD foreground_pid = 0;
@@ -181,19 +258,26 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 		if (foreground_pid == self_pid) {
 			SHORT f2_state = GetAsyncKeyState(VK_F2);
 			SHORT f3_state = GetAsyncKeyState(VK_F3);
+			SHORT f4_state = GetAsyncKeyState(VK_F4);
 			bool f2_down = (f2_state & 0x8000) != 0;
 			bool f3_down = (f3_state & 0x8000) != 0;
+			bool f4_down = (f4_state & 0x8000) != 0;
 			if (f2_down && !f2_last_down) {
 				ToggleAutoTransparent();
 			}
 			if (f3_down && !f3_last_down) {
 				ToggleFullscreenAttack();
 			}
+			if (f4_down && !f4_last_down) {
+				AttractMonstersAndItems();
+			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
+			f4_last_down = f4_down;
 		} else {
 			f2_last_down = false;
 			f3_last_down = false;
+			f4_last_down = false;
 		}
 		Sleep(kInputPollIntervalMs);
 	}
@@ -328,7 +412,6 @@ static void ToggleAutoTransparent() {
 	AnnouncePlaceholder(L"开启自动透明");
 }
 
-// F2 热键消息循环：触发自动透明开关。
 // 在独立线程中执行初始化与循环，避免在 DllMain 中做阻塞或复杂操作。
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
