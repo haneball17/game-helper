@@ -271,8 +271,9 @@ static void AttractMonstersAndItems() {
 			WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
 			continue;
 		}
-		// 怪物/敌对 APC 的 X 坐标调整到人物 X + 150，Y 坐标保持不变。
+		// 怪物/敌对 APC 的 X 坐标调整到人物 X + 150，Y 坐标与人物一致。
 		WriteFloatSafely(position_ptr + kObjectPositionXOffset, player_x + 150.0f);
+		WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
 	}
 }
 
