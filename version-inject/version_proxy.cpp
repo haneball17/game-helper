@@ -60,7 +60,7 @@ static const int kTypeApc = 273;
 static const int kMaxObjectCount = 8192;
 static const int kAttractBurstCount = 15;
 static const DWORD kAttractBurstIntervalMs = 20;
-static const DWORD kAttractLoopIntervalMs = 50;
+static const DWORD kAttractLoopIntervalMs = 20;
 static const DWORD kAttractIdleIntervalMs = 200;
 
 static BOOL g_auto_transparent_enabled = FALSE;
@@ -265,8 +265,14 @@ static void AttractMonstersAndItems() {
 		if (position_ptr == 0) {
 			continue;
 		}
-		WriteFloatSafely(position_ptr + kObjectPositionXOffset, player_x);
-		WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
+		if (type == kTypeItem) {
+			// 物品吸到人物坐标。
+			WriteFloatSafely(position_ptr + kObjectPositionXOffset, player_x);
+			WriteFloatSafely(position_ptr + kObjectPositionYOffset, player_y);
+			continue;
+		}
+		// 怪物/敌对 APC 的 X 坐标调整到人物 X + 150，Y 坐标保持不变。
+		WriteFloatSafely(position_ptr + kObjectPositionXOffset, player_x + 150.0f);
 	}
 }
 
