@@ -45,8 +45,11 @@ static const DWORD kInputPollIntervalMs = 30;
 static const DWORD kMapOffset = 0xB8;
 static const DWORD kMapStartOffset = 0xB0;
 static const DWORD kMapEndOffset = 0xB4;
-static const DWORD kTypeOffset = 0x90;
+// 类型偏移
+static const DWORD kTypeOffset = 0x94;
+// 位置 X 偏移
 static const DWORD kPositionXOffset = 0x18C;
+// 位置 Y 偏移
 static const DWORD kPositionYOffset = 0x190;
 // 对象坐标指针与子偏移
 static const DWORD kObjectPositionBaseOffset = 0xA8;
@@ -67,7 +70,7 @@ static const int kAttractModeMonsterOffset150 = 3;
 static const int kAttractModeMonsterOffset300 = 4;
 static const int kAttractModeMax = 4;
 // 怪物 X 坐标偏移配置（索引为配置模式）
-static const float kMonsterXOffsetByMode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0f, 150.0f, 300.0f};
+static const float kMonsterXOffsetByMode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0f, 150.0f, 250.0f};
 
 static BOOL g_auto_transparent_enabled = FALSE;
 // 自动吸怪配置（0 为关闭）
@@ -77,6 +80,214 @@ static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
 static BYTE g_fullscreen_attack_off_patch[kFullscreenAttackPatchSize] = {0};
 static BOOL g_fullscreen_attack_off_patch_set = FALSE;
+static const wchar_t kLogFileName[] = L"game_helper.jsonl";
+
+static CRITICAL_SECTION g_log_lock;
+static BOOL g_log_lock_ready = FALSE;
+static HANDLE g_log_file = INVALID_HANDLE_VALUE;
+static BOOL g_log_ready = FALSE;
+static wchar_t g_log_path[MAX_PATH] = {0};
+
+static BOOL GetExeDirectory(wchar_t* directory_path, size_t directory_capacity) {
+	wchar_t exe_path[MAX_PATH] = {0};
+	DWORD length = GetModuleFileNameW(NULL, exe_path, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH) {
+		return FALSE;
+	}
+	wchar_t* last_slash = wcsrchr(exe_path, L'\\');
+	if (last_slash == NULL) {
+		last_slash = wcsrchr(exe_path, L'/');
+	}
+	if (last_slash == NULL) {
+		return FALSE;
+	}
+	*(last_slash + 1) = L'\0';
+	return wcscpy_s(directory_path, directory_capacity, exe_path) == 0;
+}
+
+static BOOL BuildLogPath(const wchar_t* directory_path, wchar_t* output, size_t output_capacity) {
+	if (directory_path == NULL || directory_path[0] == L'\0') {
+		return FALSE;
+	}
+	if (wcscpy_s(output, output_capacity, directory_path) != 0) {
+		return FALSE;
+	}
+	size_t length = wcslen(output);
+	if (length == 0 || length >= output_capacity - 1) {
+		return FALSE;
+	}
+	wchar_t last = output[length - 1];
+	if (last != L'\\' && last != L'/') {
+		if (wcscat_s(output, output_capacity, L"\\") != 0) {
+			return FALSE;
+		}
+	}
+	return wcscat_s(output, output_capacity, kLogFileName) == 0;
+}
+
+static void FormatTimestamp(char* buffer, size_t buffer_capacity) {
+	SYSTEMTIME local_time;
+	ZeroMemory(&local_time, sizeof(local_time));
+	GetLocalTime(&local_time);
+	sprintf_s(
+		buffer,
+		buffer_capacity,
+		"%04u-%02u-%02uT%02u:%02u:%02u.%03u",
+		local_time.wYear,
+		local_time.wMonth,
+		local_time.wDay,
+		local_time.wHour,
+		local_time.wMinute,
+		local_time.wSecond,
+		local_time.wMilliseconds);
+}
+
+static void EscapeJsonString(const char* input, char* output, size_t output_capacity) {
+	if (output_capacity == 0) {
+		return;
+	}
+	output[0] = '\0';
+	if (input == NULL) {
+		return;
+	}
+	size_t out_index = 0;
+	for (const unsigned char* cursor = reinterpret_cast<const unsigned char*>(input); *cursor != '\0'; ++cursor) {
+		if (out_index + 2 >= output_capacity) {
+			break;
+		}
+		switch (*cursor) {
+			case '\\':
+			case '\"':
+				output[out_index++] = '\\';
+				output[out_index++] = static_cast<char>(*cursor);
+				break;
+			case '\n':
+				output[out_index++] = '\\';
+				output[out_index++] = 'n';
+				break;
+			case '\r':
+				output[out_index++] = '\\';
+				output[out_index++] = 'r';
+				break;
+			case '\t':
+				output[out_index++] = '\\';
+				output[out_index++] = 't';
+				break;
+			default:
+				if (*cursor < 0x20) {
+					output[out_index++] = '?';
+				} else {
+					output[out_index++] = static_cast<char>(*cursor);
+				}
+				break;
+		}
+	}
+	output[out_index] = '\0';
+}
+
+static void WriteLogLine(const char* level, const char* event, const char* message) {
+	if (!g_log_ready || g_log_file == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	char timestamp[32] = {0};
+	FormatTimestamp(timestamp, sizeof(timestamp));
+	char escaped_level[32] = {0};
+	char escaped_event[64] = {0};
+	char escaped_message[512] = {0};
+	EscapeJsonString(level, escaped_level, sizeof(escaped_level));
+	EscapeJsonString(event, escaped_event, sizeof(escaped_event));
+	EscapeJsonString(message, escaped_message, sizeof(escaped_message));
+	char line[1024] = {0};
+	int length = sprintf_s(
+		line,
+		sizeof(line),
+		"{\"ts\":\"%s\",\"level\":\"%s\",\"event\":\"%s\",\"message\":\"%s\",\"pid\":%lu,\"tid\":%lu}\r\n",
+		timestamp,
+		escaped_level,
+		escaped_event,
+		escaped_message,
+		GetCurrentProcessId(),
+		GetCurrentThreadId());
+	if (length <= 0) {
+		return;
+	}
+	DWORD written = 0;
+	WriteFile(g_log_file, line, static_cast<DWORD>(length), &written, NULL);
+}
+
+static void LogEvent(const char* level, const char* event, const char* message) {
+	if (!g_log_lock_ready) {
+		return;
+	}
+	EnterCriticalSection(&g_log_lock);
+	WriteLogLine(level, event, message);
+	LeaveCriticalSection(&g_log_lock);
+}
+
+static void LogEventWithError(const char* event, const char* message, DWORD error_code) {
+	char buffer[256] = {0};
+	sprintf_s(buffer, sizeof(buffer), "%s (error=%lu)", message, error_code);
+	LogEvent("ERROR", event, buffer);
+}
+
+static void LogEventWithPath(const char* event, const wchar_t* path) {
+	if (path == NULL) {
+		LogEvent("WARN", event, "path is empty");
+		return;
+	}
+	char path_utf8[512] = {0};
+	if (WideCharToMultiByte(CP_UTF8, 0, path, -1, path_utf8, sizeof(path_utf8), NULL, NULL) == 0) {
+		LogEvent("WARN", event, "path conversion failed");
+		return;
+	}
+	char message[640] = {0};
+	sprintf_s(message, sizeof(message), "path=%s", path_utf8);
+	LogEvent("INFO", event, message);
+}
+
+static BOOL OpenLogFileInDirectory(const wchar_t* directory_path) {
+	wchar_t log_path[MAX_PATH] = {0};
+	if (!BuildLogPath(directory_path, log_path, MAX_PATH)) {
+		return FALSE;
+	}
+	HANDLE file = CreateFileW(
+		log_path,
+		FILE_APPEND_DATA,
+		FILE_SHARE_READ,
+		NULL,
+		OPEN_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+	if (file == INVALID_HANDLE_VALUE) {
+		return FALSE;
+	}
+	g_log_file = file;
+	g_log_ready = TRUE;
+	wcscpy_s(g_log_path, MAX_PATH, log_path);
+	return TRUE;
+}
+
+static void InitializeLogger(const wchar_t* preferred_directory) {
+	if (g_log_lock_ready) {
+		return;
+	}
+	InitializeCriticalSection(&g_log_lock);
+	g_log_lock_ready = TRUE;
+	if (preferred_directory != NULL && preferred_directory[0] != L'\0') {
+		if (OpenLogFileInDirectory(preferred_directory)) {
+			LogEventWithPath("logger_init", g_log_path);
+			return;
+		}
+	}
+	wchar_t temp_path[MAX_PATH] = {0};
+	DWORD temp_length = GetTempPathW(MAX_PATH, temp_path);
+	if (temp_length > 0 && temp_length < MAX_PATH) {
+		if (OpenLogFileInDirectory(temp_path)) {
+			LogEventWithPath("logger_init", g_log_path);
+			return;
+		}
+	}
+}
 
 // 安全读取 DWORD，避免地址无效时导致进程崩溃。
 static DWORD ReadDwordSafely(DWORD address) {
@@ -215,21 +426,29 @@ static BOOL SetFullscreenAttackEnabled(BOOL enabled) {
 static void ToggleFullscreenAttack() {
 	BYTE current[2] = {0};
 	if (!ReadBytesSafely(kFullScreenAttackPatchAddress, current, sizeof(current))) {
+		LogEvent("WARN", "fullscreen_attack", "read_failed");
 		return;
 	}
 	RememberFullscreenAttackOffBytes(current);
 	if (IsFullscreenAttackOffBytes(current)) {
 		if (SetFullscreenAttackEnabled(TRUE)) {
 			AnnouncePlaceholder(L"开启全屏攻击");
+			LogEvent("INFO", "fullscreen_attack", "enabled");
+		} else {
+			LogEvent("WARN", "fullscreen_attack", "enable_failed");
 		}
 		return;
 	}
 	if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) == 0) {
 		if (SetFullscreenAttackEnabled(FALSE)) {
 			AnnouncePlaceholder(L"关闭全屏攻击");
+			LogEvent("INFO", "fullscreen_attack", "disabled");
+		} else {
+			LogEvent("WARN", "fullscreen_attack", "disable_failed");
 		}
 		return;
 	}
+	LogEvent("WARN", "fullscreen_attack", "state_unknown");
 }
 
 // 吸怪聚物：根据配置把怪物/物品坐标拉到人物坐标或偏移位置。
@@ -387,13 +606,13 @@ static void CallTransparent(DWORD player_ptr) {
 }
 
 // 写入劫持成功标记文件，文件内容为当前时间。
-static void WriteSuccessFile(const wchar_t* directory_path) {
+static BOOL WriteSuccessFile(const wchar_t* directory_path) {
 	wchar_t file_path[MAX_PATH] = {0};
 	if (wcscpy_s(file_path, MAX_PATH, directory_path) != 0) {
-		return;
+		return FALSE;
 	}
 	if (wcscat_s(file_path, MAX_PATH, L"test_success.txt") != 0) {
-		return;
+		return FALSE;
 	}
 
 	SYSTEMTIME local_time;
@@ -410,7 +629,7 @@ static void WriteSuccessFile(const wchar_t* directory_path) {
 		local_time.wMinute,
 		local_time.wSecond);
 	if (content_len <= 0) {
-		return;
+		return FALSE;
 	}
 
 	HANDLE file = CreateFileW(
@@ -422,12 +641,13 @@ static void WriteSuccessFile(const wchar_t* directory_path) {
 		FILE_ATTRIBUTE_NORMAL,
 		NULL);
 	if (file == INVALID_HANDLE_VALUE) {
-		return;
+		return FALSE;
 	}
 
 	DWORD written = 0;
 	WriteFile(file, content, (DWORD)content_len, &written, NULL);
 	CloseHandle(file);
+	return TRUE;
 }
 
 // 自动透明线程：复刻旧逻辑的状态机与节奏。
@@ -483,6 +703,7 @@ static void ToggleAutoTransparent() {
 			SuspendThread(g_transparent_thread);
 			SetThreadPriority(g_transparent_thread, THREAD_PRIORITY_IDLE);
 		}
+		LogEvent("INFO", "auto_transparent", "disabled");
 		return;
 	}
 
@@ -490,6 +711,7 @@ static void ToggleAutoTransparent() {
 	if (g_transparent_thread == NULL) {
 		g_transparent_thread = CreateThread(NULL, 0, TransparentThread, NULL, 0, NULL);
 		if (g_transparent_thread == NULL) {
+			LogEventWithError("transparent_thread", "create_failed", GetLastError());
 			return;
 		}
 	} else {
@@ -497,6 +719,7 @@ static void ToggleAutoTransparent() {
 	}
 	g_auto_transparent_enabled = TRUE;
 	AnnouncePlaceholder(L"开启自动透明");
+	LogEvent("INFO", "auto_transparent", "enabled");
 }
 
 // 自动吸怪切换：相同配置再次触发则关闭。
@@ -507,41 +730,66 @@ static void ToggleAttractMode(int mode, const wchar_t* message) {
 	if (g_attract_mode == mode) {
 		g_attract_mode = kAttractModeOff;
 		AnnouncePlaceholder(L"关闭吸怪聚物");
+		LogEvent("INFO", "attract_mode", "mode=0");
 		return;
 	}
 	g_attract_mode = mode;
 	if (message != NULL) {
 		AnnouncePlaceholder(message);
 	}
+	char log_message[64] = {0};
+	sprintf_s(log_message, sizeof(log_message), "mode=%d", g_attract_mode);
+	LogEvent("INFO", "attract_mode", log_message);
+}
+
+static void InitializeHelper(const wchar_t* exe_directory) {
+	if (exe_directory != NULL && exe_directory[0] != L'\0') {
+		if (WriteSuccessFile(exe_directory)) {
+			LogEvent("INFO", "success_file", "written");
+		} else {
+			LogEvent("WARN", "success_file", "write_failed");
+		}
+	} else {
+		LogEvent("WARN", "success_file", "exe_directory_missing");
+	}
+
+	if (SetFullscreenAttackEnabled(FALSE)) {
+		LogEvent("INFO", "fullscreen_attack", "reset_ok");
+	} else {
+		LogEvent("WARN", "fullscreen_attack", "reset_failed");
+	}
+
+	HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
+	if (input_thread != NULL) {
+		CloseHandle(input_thread);
+		LogEvent("INFO", "input_thread", "started");
+	} else {
+		LogEventWithError("input_thread", "create_failed", GetLastError());
+	}
+
+	HANDLE attract_thread = CreateThread(NULL, 0, AutoAttractThread, NULL, 0, NULL);
+	if (attract_thread != NULL) {
+		CloseHandle(attract_thread);
+		LogEvent("INFO", "attract_thread", "started");
+	} else {
+		LogEventWithError("attract_thread", "create_failed", GetLastError());
+	}
 }
 
 // 在独立线程中执行初始化与循环，避免在 DllMain 中做阻塞或复杂操作。
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
-	// 获取 exe 所在目录，后续将标记文件写到该目录。
-	wchar_t exe_path[MAX_PATH] = {0};
-	DWORD length = GetModuleFileNameW(NULL, exe_path, MAX_PATH);
-	if (length > 0 && length < MAX_PATH) {
-		// 截断为目录路径，保留末尾反斜杠，便于直接拼接文件名。
-		wchar_t* last_slash = wcsrchr(exe_path, L'\\');
-		if (last_slash == NULL) {
-			last_slash = wcsrchr(exe_path, L'/');
-		}
-		if (last_slash != NULL) {
-			*(last_slash + 1) = L'\0';
-			WriteSuccessFile(exe_path);
-		}
+	wchar_t exe_directory[MAX_PATH] = {0};
+	if (GetExeDirectory(exe_directory, MAX_PATH)) {
+		InitializeLogger(exe_directory);
+		LogEvent("INFO", "worker_thread", "start");
+		InitializeHelper(exe_directory);
+		return 0;
 	}
 
-	SetFullscreenAttackEnabled(FALSE);
-	HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
-	if (input_thread != NULL) {
-		CloseHandle(input_thread);
-	}
-	HANDLE attract_thread = CreateThread(NULL, 0, AutoAttractThread, NULL, 0, NULL);
-	if (attract_thread != NULL) {
-		CloseHandle(attract_thread);
-	}
+	InitializeLogger(NULL);
+	LogEvent("WARN", "worker_thread", "exe_directory_not_found");
+	InitializeHelper(NULL);
 	return 0;
 }
 
