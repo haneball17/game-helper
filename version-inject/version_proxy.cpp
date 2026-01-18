@@ -3,8 +3,92 @@
 #include <wchar.h>
 #include <string.h>
 #include <stdlib.h>
+#include <intrin.h>
 
 #include "version_exports.h"
+
+// LDR 断链与抹头（可选）支持。
+typedef struct _PEB_LDR_DATA {
+	ULONG Length;
+	BOOLEAN Initialized;
+	PVOID SsHandle;
+	LIST_ENTRY InLoadOrderModuleList;
+	LIST_ENTRY InMemoryOrderModuleList;
+	LIST_ENTRY InInitializationOrderModuleList;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
+
+typedef struct _LDR_DATA_TABLE_ENTRY {
+	LIST_ENTRY InLoadOrderLinks;
+	LIST_ENTRY InMemoryOrderLinks;
+	LIST_ENTRY InInitializationOrderLinks;
+	PVOID DllBase;
+	PVOID EntryPoint;
+	ULONG SizeOfImage;
+	UNICODE_STRING FullDllName;
+	UNICODE_STRING BaseDllName;
+} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+
+static const LONG kHideModuleResultNotAttempted = -1;
+static const LONG kHideModuleResultOk = 0;
+static const LONG kHideModuleResultLdrMissing = 1;
+static const LONG kHideModuleResultNotFound = 2;
+static volatile LONG g_hide_module_result = kHideModuleResultNotAttempted;
+
+static PPEB_LDR_DATA GetPebLdr() {
+#ifdef _WIN64
+	PBYTE peb = reinterpret_cast<PBYTE>(__readgsqword(0x60));
+	if (peb == NULL) {
+		return NULL;
+	}
+	return reinterpret_cast<PPEB_LDR_DATA>(*(reinterpret_cast<PVOID*>(peb + 0x18)));
+#else
+	PBYTE peb = reinterpret_cast<PBYTE>(__readfsdword(0x30));
+	if (peb == NULL) {
+		return NULL;
+	}
+	return reinterpret_cast<PPEB_LDR_DATA>(*(reinterpret_cast<PVOID*>(peb + 0x0C)));
+#endif
+}
+
+static LONG HideModule(HMODULE module) {
+	if (module == NULL) {
+		return kHideModuleResultNotFound;
+	}
+	PPEB_LDR_DATA ldr = GetPebLdr();
+	if (ldr == NULL) {
+		return kHideModuleResultLdrMissing;
+	}
+	LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
+	for (LIST_ENTRY* entry = head->Flink; entry != head; entry = entry->Flink) {
+		PLDR_DATA_TABLE_ENTRY data = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+		if (data->DllBase == module) {
+			// 将自身从三条链表中断开，降低被模块枚举发现的概率。
+			data->InLoadOrderLinks.Blink->Flink = data->InLoadOrderLinks.Flink;
+			data->InLoadOrderLinks.Flink->Blink = data->InLoadOrderLinks.Blink;
+			data->InMemoryOrderLinks.Blink->Flink = data->InMemoryOrderLinks.Flink;
+			data->InMemoryOrderLinks.Flink->Blink = data->InMemoryOrderLinks.Blink;
+			data->InInitializationOrderLinks.Blink->Flink = data->InInitializationOrderLinks.Flink;
+			data->InInitializationOrderLinks.Flink->Blink = data->InInitializationOrderLinks.Blink;
+			return kHideModuleResultOk;
+		}
+	}
+	return kHideModuleResultNotFound;
+}
+
+static BOOL WipeModuleHeader(HMODULE module) {
+	if (module == NULL) {
+		return FALSE;
+	}
+	const SIZE_T header_size = 4096;
+	DWORD old_protect = 0;
+	if (!VirtualProtect(module, header_size, PAGE_EXECUTE_READWRITE, &old_protect)) {
+		return FALSE;
+	}
+	SecureZeroMemory(module, header_size);
+	DWORD ignored = 0;
+	VirtualProtect(module, header_size, old_protect, &ignored);
+	return TRUE;
+}
 
 // 透明功能的绝对地址配置（x86）。
 
@@ -171,13 +255,34 @@ static BOOL BuildConfigPath(const wchar_t* directory_path, wchar_t* output, size
 struct HelperConfig {
 	DWORD startup_delay_ms;
 	BOOL apply_fullscreen_attack_patch;
+	BOOL safe_mode;
+	BOOL wipe_pe_header;
+	BOOL disable_input_thread;
+	BOOL disable_attract_thread;
+	wchar_t output_directory[MAX_PATH];
+	BOOL output_directory_set;
 };
 
 static HelperConfig GetDefaultHelperConfig() {
 	HelperConfig config = {0};
 	config.startup_delay_ms = 0;
-	config.apply_fullscreen_attack_patch = TRUE;
+	config.apply_fullscreen_attack_patch = FALSE;
+	config.safe_mode = FALSE;
+	config.wipe_pe_header = FALSE;
+	config.disable_input_thread = FALSE;
+	config.disable_attract_thread = FALSE;
+	config.output_directory[0] = L'\0';
+	config.output_directory_set = FALSE;
 	return config;
+}
+
+static BOOL ReadIniStringValue(const wchar_t* path, const wchar_t* section, const wchar_t* key, wchar_t* output, size_t output_capacity) {
+	if (output == NULL || output_capacity == 0) {
+		return FALSE;
+	}
+	output[0] = L'\0';
+	DWORD read = GetPrivateProfileStringW(section, key, L"", output, static_cast<DWORD>(output_capacity), path);
+	return read > 0;
 }
 
 static DWORD ReadIniUInt32(const wchar_t* path, const wchar_t* section, const wchar_t* key, DWORD default_value) {
@@ -209,6 +314,17 @@ static BOOL ReadIniBool(const wchar_t* path, const wchar_t* section, const wchar
 	return default_value;
 }
 
+static BOOL IsDirectoryValid(const wchar_t* path) {
+	if (path == NULL || path[0] == L'\0') {
+		return FALSE;
+	}
+	DWORD attrs = GetFileAttributesW(path);
+	if (attrs == INVALID_FILE_ATTRIBUTES) {
+		return FALSE;
+	}
+	return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
 static BOOL LoadHelperConfig(const wchar_t* config_path, HelperConfig* config) {
 	if (config == NULL || config_path == NULL || config_path[0] == L'\0') {
 		return FALSE;
@@ -218,7 +334,14 @@ static BOOL LoadHelperConfig(const wchar_t* config_path, HelperConfig* config) {
 		return FALSE;
 	}
 	config->startup_delay_ms = ReadIniUInt32(config_path, L"startup", L"startup_delay_ms", config->startup_delay_ms);
+	config->safe_mode = ReadIniBool(config_path, L"startup", L"safe_mode", config->safe_mode);
 	config->apply_fullscreen_attack_patch = ReadIniBool(config_path, L"patch", L"apply_fullscreen_attack_patch", config->apply_fullscreen_attack_patch);
+	config->wipe_pe_header = ReadIniBool(config_path, L"stealth", L"wipe_pe_header", config->wipe_pe_header);
+	config->disable_input_thread = ReadIniBool(config_path, L"feature", L"disable_input_thread", config->disable_input_thread);
+	config->disable_attract_thread = ReadIniBool(config_path, L"feature", L"disable_attract_thread", config->disable_attract_thread);
+	if (ReadIniStringValue(config_path, L"output", L"output_dir", config->output_directory, MAX_PATH)) {
+		config->output_directory_set = TRUE;
+	}
 	return TRUE;
 }
 
@@ -839,15 +962,33 @@ static void ToggleAttractMode(int mode, const wchar_t* message) {
 	LogEvent("INFO", "attract_mode", log_message);
 }
 
-static void InitializeHelper(const wchar_t* exe_directory, const HelperConfig& config) {
-	if (exe_directory != NULL && exe_directory[0] != L'\0') {
-		if (WriteSuccessFile(exe_directory)) {
+static void InitializeHelper(const wchar_t* output_directory, const HelperConfig& config) {
+	if (config.safe_mode) {
+		LogEvent("INFO", "safe_mode", "enabled");
+		if (config.wipe_pe_header) {
+			LogEvent("INFO", "module_header_wipe", "skip_by_safe_mode");
+		}
+		return;
+	}
+
+	if (config.wipe_pe_header) {
+		if (WipeModuleHeader(g_self_module)) {
+			LogEvent("INFO", "module_header_wipe", "ok");
+		} else {
+			LogEvent("WARN", "module_header_wipe", "failed");
+		}
+	} else {
+		LogEvent("INFO", "module_header_wipe", "skip_by_config");
+	}
+
+	if (output_directory != NULL && output_directory[0] != L'\0') {
+		if (WriteSuccessFile(output_directory)) {
 			LogEvent("INFO", "success_file", "written");
 		} else {
 			LogEvent("WARN", "success_file", "write_failed");
 		}
 	} else {
-		LogEvent("WARN", "success_file", "exe_directory_missing");
+		LogEvent("WARN", "success_file", "output_directory_missing");
 	}
 
 	if (config.startup_delay_ms > 0) {
@@ -867,20 +1008,28 @@ static void InitializeHelper(const wchar_t* exe_directory, const HelperConfig& c
 		LogEvent("INFO", "fullscreen_attack", "skip_by_config");
 	}
 
-	HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
-	if (input_thread != NULL) {
-		CloseHandle(input_thread);
-		LogEvent("INFO", "input_thread", "started");
+	if (config.disable_input_thread) {
+		LogEvent("INFO", "input_thread", "disabled_by_config");
 	} else {
-		LogEventWithError("input_thread", "create_failed", GetLastError());
+		HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
+		if (input_thread != NULL) {
+			CloseHandle(input_thread);
+			LogEvent("INFO", "input_thread", "started");
+		} else {
+			LogEventWithError("input_thread", "create_failed", GetLastError());
+		}
 	}
 
-	HANDLE attract_thread = CreateThread(NULL, 0, AutoAttractThread, NULL, 0, NULL);
-	if (attract_thread != NULL) {
-		CloseHandle(attract_thread);
-		LogEvent("INFO", "attract_thread", "started");
+	if (config.disable_attract_thread) {
+		LogEvent("INFO", "attract_thread", "disabled_by_config");
 	} else {
-		LogEventWithError("attract_thread", "create_failed", GetLastError());
+		HANDLE attract_thread = CreateThread(NULL, 0, AutoAttractThread, NULL, 0, NULL);
+		if (attract_thread != NULL) {
+			CloseHandle(attract_thread);
+			LogEvent("INFO", "attract_thread", "started");
+		} else {
+			LogEventWithError("attract_thread", "create_failed", GetLastError());
+		}
 	}
 }
 
@@ -889,49 +1038,78 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
 	wchar_t exe_directory[MAX_PATH] = {0};
 	BOOL has_exe_directory = GetExeDirectory(exe_directory, MAX_PATH);
-	if (has_exe_directory) {
-		InitializeLogger(exe_directory);
-	} else {
-		InitializeLogger(NULL);
-	}
-
-	LogEvent("INFO", "worker_thread", "start");
-	if (!has_exe_directory) {
-		LogEvent("WARN", "worker_thread", "exe_directory_not_found");
-	}
+	wchar_t module_directory[MAX_PATH] = {0};
+	BOOL has_module_directory = GetModuleDirectory(g_self_module, module_directory, MAX_PATH);
+	const wchar_t* default_output_directory = has_module_directory ? module_directory : (has_exe_directory ? exe_directory : NULL);
 
 	HelperConfig config = GetDefaultHelperConfig();
 	BOOL config_loaded = FALSE;
 	wchar_t config_path[MAX_PATH] = {0};
-	wchar_t module_directory[MAX_PATH] = {0};
-	if (GetModuleDirectory(g_self_module, module_directory, MAX_PATH) &&
+	if (has_module_directory &&
 		BuildConfigPath(module_directory, config_path, MAX_PATH) &&
 		LoadHelperConfig(config_path, &config)) {
 		config_loaded = TRUE;
-		LogEventWithPath("config_loaded", config_path);
 	}
 
 	if (!config_loaded && has_exe_directory &&
 		BuildConfigPath(exe_directory, config_path, MAX_PATH) &&
 		LoadHelperConfig(config_path, &config)) {
 		config_loaded = TRUE;
-		LogEventWithPath("config_loaded", config_path);
 	}
 
-	if (!config_loaded) {
+	const wchar_t* output_directory = default_output_directory;
+	if (config.output_directory_set) {
+		if (IsDirectoryValid(config.output_directory)) {
+			output_directory = config.output_directory;
+		} else {
+			output_directory = default_output_directory;
+		}
+	}
+
+	InitializeLogger(output_directory);
+	LogEvent("INFO", "worker_thread", "start");
+	if (!has_exe_directory) {
+		LogEvent("WARN", "worker_thread", "exe_directory_not_found");
+	}
+
+	if (config_loaded) {
+		LogEventWithPath("config_loaded", config_path);
+	} else {
 		LogEvent("INFO", "config_loaded", "default");
 	}
 
-	char config_message[128] = {0};
+	if (g_hide_module_result == kHideModuleResultOk) {
+		LogEvent("INFO", "hide_module", "ok");
+	} else if (g_hide_module_result == kHideModuleResultLdrMissing) {
+		LogEvent("WARN", "hide_module", "ldr_missing");
+	} else if (g_hide_module_result == kHideModuleResultNotFound) {
+		LogEvent("WARN", "hide_module", "not_found");
+	} else {
+		LogEvent("WARN", "hide_module", "not_attempted");
+	}
+
+	if (config.output_directory_set && !IsDirectoryValid(config.output_directory)) {
+		LogEventWithPath("output_dir_invalid", config.output_directory);
+	}
+
+	char config_message[160] = {0};
 	sprintf_s(
 		config_message,
 		sizeof(config_message),
-		"startup_delay_ms=%lu apply_fullscreen_attack_patch=%d",
+		"startup_delay_ms=%lu apply_fullscreen_attack_patch=%d safe_mode=%d wipe_pe_header=%d disable_input_thread=%d disable_attract_thread=%d",
 		config.startup_delay_ms,
-		config.apply_fullscreen_attack_patch);
+		config.apply_fullscreen_attack_patch,
+		config.safe_mode,
+		config.wipe_pe_header,
+		config.disable_input_thread,
+		config.disable_attract_thread);
 	LogEvent("INFO", "config_effective", config_message);
 
-	InitializeHelper(has_exe_directory ? exe_directory : NULL, config);
+	if (output_directory != NULL) {
+		LogEventWithPath("output_directory", output_directory);
+	}
+
+	InitializeHelper(output_directory, config);
 	return 0;
 }
 
@@ -940,6 +1118,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 
 	if (reason == DLL_PROCESS_ATTACH) {
 		g_self_module = module;
+		// 先断链隐藏模块，降低被模块枚举发现的概率。
+		g_hide_module_result = HideModule(module);
 		// 避免线程通知开销，并把工作放到新线程，降低加载期风险。
 		DisableThreadLibraryCalls(module);
 		HANDLE thread = CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL);

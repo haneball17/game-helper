@@ -69,15 +69,27 @@
 - 放置位置：优先与 `GameHelper.dll` 同目录；若不存在则尝试游戏目录。
 - 作用：
   - 控制 DLL 启动延迟
+  - 安全模式：仅加载 DLL，不写任何标记文件、不启动线程、不打补丁
   - 控制是否在启动时应用全屏攻击补丁
+  - 线程级开关：禁用输入轮询/吸怪线程
+  - 控制日志与 test_success.txt 输出目录
+  - 默认关闭启动时补丁（防止版本不匹配导致闪退）
 
 **示例：**
 ```ini
 [startup]
 startup_delay_ms=8000
+safe_mode=false
 
 [patch]
 apply_fullscreen_attack_patch=false
+
+[feature]
+disable_input_thread=false
+disable_attract_thread=false
+
+[output]
+output_dir=E:/tools/injector
 ```
 
 ### 6.2 控制台注入器（仅设计约束）
