@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "version_exports.h"
 
@@ -81,6 +82,8 @@ static BOOL g_character_transparent = FALSE;
 static BYTE g_fullscreen_attack_off_patch[kFullscreenAttackPatchSize] = {0};
 static BOOL g_fullscreen_attack_off_patch_set = FALSE;
 static const wchar_t kLogFileName[] = L"game_helper.jsonl";
+static const wchar_t kConfigFileName[] = L"game_helper.ini";
+static HMODULE g_self_module = NULL;
 
 static CRITICAL_SECTION g_log_lock;
 static BOOL g_log_lock_ready = FALSE;
@@ -105,6 +108,26 @@ static BOOL GetExeDirectory(wchar_t* directory_path, size_t directory_capacity) 
 	return wcscpy_s(directory_path, directory_capacity, exe_path) == 0;
 }
 
+static BOOL GetModuleDirectory(HMODULE module, wchar_t* directory_path, size_t directory_capacity) {
+	if (module == NULL) {
+		return FALSE;
+	}
+	wchar_t module_path[MAX_PATH] = {0};
+	DWORD length = GetModuleFileNameW(module, module_path, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH) {
+		return FALSE;
+	}
+	wchar_t* last_slash = wcsrchr(module_path, L'\\');
+	if (last_slash == NULL) {
+		last_slash = wcsrchr(module_path, L'/');
+	}
+	if (last_slash == NULL) {
+		return FALSE;
+	}
+	*(last_slash + 1) = L'\0';
+	return wcscpy_s(directory_path, directory_capacity, module_path) == 0;
+}
+
 static BOOL BuildLogPath(const wchar_t* directory_path, wchar_t* output, size_t output_capacity) {
 	if (directory_path == NULL || directory_path[0] == L'\0') {
 		return FALSE;
@@ -123,6 +146,80 @@ static BOOL BuildLogPath(const wchar_t* directory_path, wchar_t* output, size_t 
 		}
 	}
 	return wcscat_s(output, output_capacity, kLogFileName) == 0;
+}
+
+static BOOL BuildConfigPath(const wchar_t* directory_path, wchar_t* output, size_t output_capacity) {
+	if (directory_path == NULL || directory_path[0] == L'\0') {
+		return FALSE;
+	}
+	if (wcscpy_s(output, output_capacity, directory_path) != 0) {
+		return FALSE;
+	}
+	size_t length = wcslen(output);
+	if (length == 0 || length >= output_capacity - 1) {
+		return FALSE;
+	}
+	wchar_t last = output[length - 1];
+	if (last != L'\\' && last != L'/') {
+		if (wcscat_s(output, output_capacity, L"\\") != 0) {
+			return FALSE;
+		}
+	}
+	return wcscat_s(output, output_capacity, kConfigFileName) == 0;
+}
+
+struct HelperConfig {
+	DWORD startup_delay_ms;
+	BOOL apply_fullscreen_attack_patch;
+};
+
+static HelperConfig GetDefaultHelperConfig() {
+	HelperConfig config = {0};
+	config.startup_delay_ms = 0;
+	config.apply_fullscreen_attack_patch = TRUE;
+	return config;
+}
+
+static DWORD ReadIniUInt32(const wchar_t* path, const wchar_t* section, const wchar_t* key, DWORD default_value) {
+	wchar_t buffer[32] = {0};
+	DWORD read = GetPrivateProfileStringW(section, key, L"", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), path);
+	if (read == 0) {
+		return default_value;
+	}
+	wchar_t* end = NULL;
+	unsigned long parsed = wcstoul(buffer, &end, 10);
+	if (end == buffer) {
+		return default_value;
+	}
+	return static_cast<DWORD>(parsed);
+}
+
+static BOOL ReadIniBool(const wchar_t* path, const wchar_t* section, const wchar_t* key, BOOL default_value) {
+	wchar_t buffer[32] = {0};
+	DWORD read = GetPrivateProfileStringW(section, key, default_value ? L"true" : L"false", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), path);
+	if (read == 0) {
+		return default_value;
+	}
+	if (_wcsicmp(buffer, L"1") == 0 || _wcsicmp(buffer, L"true") == 0 || _wcsicmp(buffer, L"yes") == 0 || _wcsicmp(buffer, L"on") == 0) {
+		return TRUE;
+	}
+	if (_wcsicmp(buffer, L"0") == 0 || _wcsicmp(buffer, L"false") == 0 || _wcsicmp(buffer, L"no") == 0 || _wcsicmp(buffer, L"off") == 0) {
+		return FALSE;
+	}
+	return default_value;
+}
+
+static BOOL LoadHelperConfig(const wchar_t* config_path, HelperConfig* config) {
+	if (config == NULL || config_path == NULL || config_path[0] == L'\0') {
+		return FALSE;
+	}
+	DWORD attrs = GetFileAttributesW(config_path);
+	if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+		return FALSE;
+	}
+	config->startup_delay_ms = ReadIniUInt32(config_path, L"startup", L"startup_delay_ms", config->startup_delay_ms);
+	config->apply_fullscreen_attack_patch = ReadIniBool(config_path, L"patch", L"apply_fullscreen_attack_patch", config->apply_fullscreen_attack_patch);
+	return TRUE;
 }
 
 static void FormatTimestamp(char* buffer, size_t buffer_capacity) {
@@ -742,7 +839,7 @@ static void ToggleAttractMode(int mode, const wchar_t* message) {
 	LogEvent("INFO", "attract_mode", log_message);
 }
 
-static void InitializeHelper(const wchar_t* exe_directory) {
+static void InitializeHelper(const wchar_t* exe_directory, const HelperConfig& config) {
 	if (exe_directory != NULL && exe_directory[0] != L'\0') {
 		if (WriteSuccessFile(exe_directory)) {
 			LogEvent("INFO", "success_file", "written");
@@ -753,10 +850,21 @@ static void InitializeHelper(const wchar_t* exe_directory) {
 		LogEvent("WARN", "success_file", "exe_directory_missing");
 	}
 
-	if (SetFullscreenAttackEnabled(FALSE)) {
-		LogEvent("INFO", "fullscreen_attack", "reset_ok");
+	if (config.startup_delay_ms > 0) {
+		char delay_message[64] = {0};
+		sprintf_s(delay_message, sizeof(delay_message), "delay_ms=%lu", config.startup_delay_ms);
+		LogEvent("INFO", "startup_delay", delay_message);
+		Sleep(config.startup_delay_ms);
+	}
+
+	if (config.apply_fullscreen_attack_patch) {
+		if (SetFullscreenAttackEnabled(FALSE)) {
+			LogEvent("INFO", "fullscreen_attack", "reset_ok");
+		} else {
+			LogEvent("WARN", "fullscreen_attack", "reset_failed");
+		}
 	} else {
-		LogEvent("WARN", "fullscreen_attack", "reset_failed");
+		LogEvent("INFO", "fullscreen_attack", "skip_by_config");
 	}
 
 	HANDLE input_thread = CreateThread(NULL, 0, InputPollThread, NULL, 0, NULL);
@@ -780,16 +888,50 @@ static void InitializeHelper(const wchar_t* exe_directory) {
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
 	wchar_t exe_directory[MAX_PATH] = {0};
-	if (GetExeDirectory(exe_directory, MAX_PATH)) {
+	BOOL has_exe_directory = GetExeDirectory(exe_directory, MAX_PATH);
+	if (has_exe_directory) {
 		InitializeLogger(exe_directory);
-		LogEvent("INFO", "worker_thread", "start");
-		InitializeHelper(exe_directory);
-		return 0;
+	} else {
+		InitializeLogger(NULL);
 	}
 
-	InitializeLogger(NULL);
-	LogEvent("WARN", "worker_thread", "exe_directory_not_found");
-	InitializeHelper(NULL);
+	LogEvent("INFO", "worker_thread", "start");
+	if (!has_exe_directory) {
+		LogEvent("WARN", "worker_thread", "exe_directory_not_found");
+	}
+
+	HelperConfig config = GetDefaultHelperConfig();
+	BOOL config_loaded = FALSE;
+	wchar_t config_path[MAX_PATH] = {0};
+	wchar_t module_directory[MAX_PATH] = {0};
+	if (GetModuleDirectory(g_self_module, module_directory, MAX_PATH) &&
+		BuildConfigPath(module_directory, config_path, MAX_PATH) &&
+		LoadHelperConfig(config_path, &config)) {
+		config_loaded = TRUE;
+		LogEventWithPath("config_loaded", config_path);
+	}
+
+	if (!config_loaded && has_exe_directory &&
+		BuildConfigPath(exe_directory, config_path, MAX_PATH) &&
+		LoadHelperConfig(config_path, &config)) {
+		config_loaded = TRUE;
+		LogEventWithPath("config_loaded", config_path);
+	}
+
+	if (!config_loaded) {
+		LogEvent("INFO", "config_loaded", "default");
+	}
+
+	char config_message[128] = {0};
+	sprintf_s(
+		config_message,
+		sizeof(config_message),
+		"startup_delay_ms=%lu apply_fullscreen_attack_patch=%d",
+		config.startup_delay_ms,
+		config.apply_fullscreen_attack_patch);
+	LogEvent("INFO", "config_effective", config_message);
+
+	InitializeHelper(has_exe_directory ? exe_directory : NULL, config);
 	return 0;
 }
 
@@ -797,6 +939,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
 	UNREFERENCED_PARAMETER(reserved);
 
 	if (reason == DLL_PROCESS_ATTACH) {
+		g_self_module = module;
 		// 避免线程通知开销，并把工作放到新线程，降低加载期风险。
 		DisableThreadLibraryCalls(module);
 		HANDLE thread = CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL);

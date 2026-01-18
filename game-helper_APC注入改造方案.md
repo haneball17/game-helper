@@ -64,6 +64,22 @@
 - 初始化线程执行核心逻辑与资源准备，避免阻塞游戏主线程。
 - 关键流程需中文日志（文件落地或调试输出），用于验证加载结果。
 
+#### 6.1.1 DLL 配置文件（game_helper.ini）
+
+- 放置位置：优先与 `GameHelper.dll` 同目录；若不存在则尝试游戏目录。
+- 作用：
+  - 控制 DLL 启动延迟
+  - 控制是否在启动时应用全屏攻击补丁
+
+**示例：**
+```ini
+[startup]
+startup_delay_ms=8000
+
+[patch]
+apply_fullscreen_attack_patch=false
+```
+
 ### 6.2 控制台注入器（仅设计约束）
 
 - 进程探测：循环检测 `dnf.exe`，间隔可配置。
@@ -80,17 +96,23 @@
 [target]
 process_name=dnf.exe
 dll_path=C:/Users/User/Desktop/GameHelper.dll
-detect_interval_ms=1000
+scan_interval_ms=1000
 inject_delay_ms=3000
+watch_mode=true
+exit_when_no_processes=false
 
 [apc]
 max_retries=5
 retry_interval_ms=2000
+module_check_timeout_ms=8000
+module_check_interval_ms=200
+module_check_extend_ms=5000
 
 [log]
 log_path=./logs/injector.log
 log_level=INFO
 log_format=json
+log_pid_list=false
 console_output=true
 file_output=true
 ```
@@ -119,11 +141,13 @@ file_output=true
 - 日志字段：时间戳、步骤、结果、错误码、重试计数、线程数量、成功入队数
 - 关键输出点：
   - 进程发现
+  - 多进程扫描与去重
   - 句柄获取
   - 远程内存分配
   - 路径写入
   - 线程枚举数量
   - APC 入队成功数
+  - 模块加载校验（含延长等待）
   - 重试次数与最终结果
 
 ### 6.6 注入器伪代码（APC）
@@ -133,22 +157,27 @@ file_output=true
 初始化日志(JSON Lines)
 
 校验配置(dll_path 必须存在, process_name 必填)
-等待目标进程出现
-等待注入延迟
+循环扫描目标进程列表
+维护已注入 PID 集合
+新进程出现即注入
+按配置决定何时退出
 
-for attempt in 1..max_retries:
-  打开目标进程
-  远程申请内存写入 DLL 路径
-  解析 LoadLibraryW 地址
-  枚举目标线程并 QueueUserAPC
-  记录 thread_count 与 queued_count
-  if queued_count > 0:
-    记录成功日志并退出
-  else:
-    记录失败日志并 sleep(retry_interval)
+for each pid in new_pids:
+  for attempt in 1..max_retries:
+    打开目标进程
+    远程申请内存写入 DLL 路径
+    解析 LoadLibraryW 地址
+    枚举目标线程并 QueueUserAPC
+    记录 thread_count 与 queued_count
+    等待模块加载校验
+    if module_loaded:
+      记录成功日志并标记已注入
+      break
+    else:
+      记录失败日志并 sleep(retry_interval)
 
-如果全部失败:
-  记录最终失败日志并退出
+若全部失败:
+  记录最终失败日志并继续监控
 ```
 
 ### 6.7 JSON 日志规范

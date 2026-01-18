@@ -3,6 +3,8 @@
 #include <tlhelp32.h>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 #include <iostream>
 #include <string.h>
 #include <stdlib.h>
@@ -10,12 +12,18 @@
 struct InjectorConfig {
 	std::wstring process_name;
 	std::wstring dll_path;
-	DWORD detect_interval_ms;
+	DWORD scan_interval_ms;
 	DWORD inject_delay_ms;
 	int max_retries;
 	DWORD retry_interval_ms;
+	DWORD module_check_timeout_ms;
+	DWORD module_check_interval_ms;
+	DWORD module_check_extend_ms;
+	bool watch_mode;
+	bool exit_when_no_processes;
 	std::wstring log_path;
 	std::string log_level;
+	bool log_pid_list;
 	bool console_output;
 	bool file_output;
 };
@@ -116,6 +124,38 @@ static std::wstring NormalizePath(const std::wstring& path, const std::wstring& 
 		return candidate;
 	}
 	return full_path;
+}
+
+static std::wstring GetBaseName(const std::wstring& path) {
+	if (path.empty()) {
+		return L"";
+	}
+	size_t pos = path.find_last_of(L"\\/");
+	if (pos == std::wstring::npos) {
+		return path;
+	}
+	return path.substr(pos + 1);
+}
+
+static std::string BuildPidListMessage(const std::vector<DWORD>& pids) {
+	std::string message = "count=" + std::to_string(pids.size()) + " pids=";
+	for (size_t i = 0; i < pids.size(); ++i) {
+		message += std::to_string(pids[i]);
+		if (i + 1 < pids.size()) {
+			message += ",";
+		}
+	}
+	return message;
+}
+
+static std::string BuildPidListHash(const std::vector<DWORD>& pids) {
+	std::string hash;
+	hash.reserve(pids.size() * 12);
+	for (size_t i = 0; i < pids.size(); ++i) {
+		hash += std::to_string(pids[i]);
+		hash += ",";
+	}
+	return hash;
 }
 
 static bool ParseBool(const std::wstring& value, bool default_value) {
@@ -344,12 +384,18 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	InjectorConfig settings;
 	settings.process_name = L"dnf.exe";
 	settings.dll_path = L"";
-	settings.detect_interval_ms = 1000;
+	settings.scan_interval_ms = 1000;
 	settings.inject_delay_ms = 3000;
 	settings.max_retries = 5;
 	settings.retry_interval_ms = 2000;
+	settings.module_check_timeout_ms = 8000;
+	settings.module_check_interval_ms = 200;
+	settings.module_check_extend_ms = 5000;
+	settings.watch_mode = true;
+	settings.exit_when_no_processes = false;
 	settings.log_path = L"injector.jsonl";
 	settings.log_level = "INFO";
+	settings.log_pid_list = false;
 	settings.console_output = true;
 	settings.file_output = true;
 	*loaded = false;
@@ -363,18 +409,28 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 
 	settings.process_name = ReadIniStringValue(config_path, L"target", L"process_name", settings.process_name.c_str());
 	settings.dll_path = ReadIniStringValue(config_path, L"target", L"dll_path", settings.dll_path.c_str());
-	settings.detect_interval_ms = ReadIniUInt32(config_path, L"target", L"detect_interval_ms", settings.detect_interval_ms);
+	DWORD detect_interval = ReadIniUInt32(config_path, L"target", L"detect_interval_ms", settings.scan_interval_ms);
+	settings.scan_interval_ms = ReadIniUInt32(config_path, L"target", L"scan_interval_ms", detect_interval);
 	settings.inject_delay_ms = ReadIniUInt32(config_path, L"target", L"inject_delay_ms", settings.inject_delay_ms);
+	settings.watch_mode = ParseBool(ReadIniStringValue(config_path, L"target", L"watch_mode", settings.watch_mode ? L"true" : L"false"), settings.watch_mode);
+	settings.exit_when_no_processes = ParseBool(ReadIniStringValue(config_path, L"target", L"exit_when_no_processes", settings.exit_when_no_processes ? L"true" : L"false"), settings.exit_when_no_processes);
 	settings.max_retries = static_cast<int>(ReadIniUInt32(config_path, L"apc", L"max_retries", static_cast<DWORD>(settings.max_retries)));
 	settings.retry_interval_ms = ReadIniUInt32(config_path, L"apc", L"retry_interval_ms", settings.retry_interval_ms);
+	settings.module_check_timeout_ms = ReadIniUInt32(config_path, L"apc", L"module_check_timeout_ms", settings.module_check_timeout_ms);
+	settings.module_check_interval_ms = ReadIniUInt32(config_path, L"apc", L"module_check_interval_ms", settings.module_check_interval_ms);
+	settings.module_check_extend_ms = ReadIniUInt32(config_path, L"apc", L"module_check_extend_ms", settings.module_check_extend_ms);
 	settings.log_path = ReadIniStringValue(config_path, L"log", L"log_path", settings.log_path.c_str());
 	settings.log_level = WideToUtf8(ReadIniStringValue(config_path, L"log", L"log_level", L"INFO"));
 	std::wstring format = ReadIniStringValue(config_path, L"log", L"log_format", L"json");
+	settings.log_pid_list = ParseBool(ReadIniStringValue(config_path, L"log", L"log_pid_list", L"false"), settings.log_pid_list);
 	settings.console_output = ParseBool(ReadIniStringValue(config_path, L"log", L"console_output", L"true"), true);
 	settings.file_output = ParseBool(ReadIniStringValue(config_path, L"log", L"file_output", L"true"), true);
 
 	// DLL 相对路径统一转为注入器目录下的绝对路径，避免目标进程工作目录不一致导致加载失败。
 	settings.dll_path = NormalizePath(settings.dll_path, exe_dir);
+	if (settings.module_check_interval_ms == 0) {
+		settings.module_check_interval_ms = 200;
+	}
 
 	if (_wcsicmp(format.c_str(), L"json") != 0) {
 		format = L"json";
@@ -405,6 +461,25 @@ static DWORD FindProcessIdByName(const std::wstring& process_name) {
 	return result;
 }
 
+static std::vector<DWORD> ListProcessIdsByName(const std::wstring& process_name) {
+	std::vector<DWORD> results;
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return results;
+	}
+	PROCESSENTRY32W entry = {0};
+	entry.dwSize = sizeof(entry);
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			if (_wcsicmp(entry.szExeFile, process_name.c_str()) == 0) {
+				results.push_back(entry.th32ProcessID);
+			}
+		} while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return results;
+}
+
 static std::vector<DWORD> ListThreadIds(DWORD pid) {
 	std::vector<DWORD> threads;
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -424,7 +499,41 @@ static std::vector<DWORD> ListThreadIds(DWORD pid) {
 	return threads;
 }
 
-static bool InjectByApc(DWORD pid, const InjectorConfig& settings, JsonLogger& logger, int attempt) {
+static bool IsModuleLoaded(DWORD pid, const std::wstring& module_name, const std::wstring& module_path) {
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	MODULEENTRY32W entry = {0};
+	entry.dwSize = sizeof(entry);
+	bool found = false;
+	if (Module32FirstW(snapshot, &entry)) {
+		do {
+			if (_wcsicmp(entry.szModule, module_name.c_str()) == 0 ||
+				_wcsicmp(entry.szExePath, module_path.c_str()) == 0) {
+				found = true;
+				break;
+			}
+		} while (Module32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return found;
+}
+
+static bool WaitForModuleLoaded(DWORD pid, const std::wstring& module_name, const std::wstring& module_path, DWORD timeout_ms, DWORD interval_ms) {
+	ULONGLONG start = GetTickCount64();
+	for (;;) {
+		if (IsModuleLoaded(pid, module_name, module_path)) {
+			return true;
+		}
+		if (GetTickCount64() - start >= timeout_ms) {
+			return false;
+		}
+		Sleep(interval_ms);
+	}
+}
+
+static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::wstring& module_name, JsonLogger& logger, int attempt) {
 	// APC 注入核心流程：远程写入路径 + QueueUserAPC
 	LogExtras extras;
 	extras.pid = pid;
@@ -488,8 +597,51 @@ static bool InjectByApc(DWORD pid, const InjectorConfig& settings, JsonLogger& l
 		return false;
 	}
 
+	logger.Log("INFO", "module_check", "start", extras);
+	bool loaded = WaitForModuleLoaded(pid, module_name, settings.dll_path, settings.module_check_timeout_ms, settings.module_check_interval_ms);
+	if (!loaded && settings.module_check_extend_ms > 0) {
+		char extend_message[64] = {0};
+		sprintf_s(extend_message, "extend_ms=%lu", settings.module_check_extend_ms);
+		logger.Log("WARN", "module_check_extend", extend_message, extras);
+		loaded = WaitForModuleLoaded(pid, module_name, settings.dll_path, settings.module_check_extend_ms, settings.module_check_interval_ms);
+	}
+	logger.Log(loaded ? "INFO" : "WARN", "module_check", loaded ? "loaded" : "timeout", extras);
+
 	CloseHandle(process);
-	return true;
+	return loaded;
+}
+
+static bool InjectProcessWithRetries(DWORD pid, const InjectorConfig& settings, const std::wstring& module_name, JsonLogger& logger, std::string* last_error) {
+	LogExtras extras;
+	extras.pid = pid;
+	extras.process_name = settings.process_name;
+	extras.dll_path = settings.dll_path;
+
+	for (int attempt = 1; attempt <= settings.max_retries; ++attempt) {
+		extras.attempt = attempt;
+		extras.result = "fail";
+		if (InjectByApc(pid, settings, module_name, logger, attempt)) {
+			extras.result = "ok";
+			logger.Log("INFO", "inject_result", "success", extras);
+			if (last_error != NULL) {
+				*last_error = "ok";
+			}
+			return true;
+		}
+		logger.Log("WARN", "inject_result", "retry", extras);
+		if (last_error != NULL) {
+			*last_error = "retry";
+		}
+		if (attempt < settings.max_retries) {
+			Sleep(settings.retry_interval_ms);
+		}
+	}
+
+	logger.Log("ERROR", "inject_result", "failed", extras);
+	if (last_error != NULL) {
+		*last_error = "failed";
+	}
+	return false;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -525,40 +677,105 @@ int wmain(int argc, wchar_t* argv[]) {
 		return 1;
 	}
 
-	logger.Log("INFO", "wait_process", "start", extras);
-	DWORD pid = 0;
-	while (pid == 0) {
-		pid = FindProcessIdByName(settings.process_name);
-		if (pid == 0) {
-			Sleep(settings.detect_interval_ms);
+	std::wstring module_name = GetBaseName(settings.dll_path);
+	if (module_name.empty()) {
+		logger.Log("ERROR", "config", "module_name_empty", extras);
+		return 1;
+	}
+
+	if (!settings.watch_mode) {
+		logger.Log("INFO", "wait_process", "start", extras);
+		DWORD pid = 0;
+		while (pid == 0) {
+			pid = FindProcessIdByName(settings.process_name);
+			if (pid == 0) {
+				Sleep(settings.scan_interval_ms);
+			}
 		}
+		extras.pid = pid;
+		logger.Log("INFO", "process_found", "ok", extras);
+		if (settings.inject_delay_ms > 0) {
+			Sleep(settings.inject_delay_ms);
+		}
+		return InjectProcessWithRetries(pid, settings, module_name, logger) ? 0 : 1;
 	}
-	extras.pid = pid;
-	logger.Log("INFO", "process_found", "ok", extras);
 
-	if (settings.inject_delay_ms > 0) {
-		Sleep(settings.inject_delay_ms);
-	}
+	bool ever_found = false;
+	std::unordered_set<DWORD> injected_pids;
+	std::unordered_map<DWORD, int> pid_attempts;
+	std::unordered_map<DWORD, std::string> pid_last_error;
+	std::string last_pid_hash;
+	logger.Log("INFO", "watch_mode", "start", extras);
+	for (;;) {
+		std::vector<DWORD> pids = ListProcessIdsByName(settings.process_name);
+		if (settings.log_pid_list) {
+			std::string current_hash = BuildPidListHash(pids);
+			if (current_hash != last_pid_hash) {
+				last_pid_hash = current_hash;
+				logger.Log("INFO", "scan_pids", BuildPidListMessage(pids), extras);
+			}
+		}
+		if (!pids.empty()) {
+			ever_found = true;
+		}
 
-	bool injected = false;
-	for (int attempt = 1; attempt <= settings.max_retries; ++attempt) {
-		extras.attempt = attempt;
-		if (InjectByApc(pid, settings, logger, attempt)) {
-			extras.result = "ok";
-			logger.Log("INFO", "inject_result", "success", extras);
-			injected = true;
+		std::unordered_set<DWORD> current(pids.begin(), pids.end());
+		for (std::unordered_set<DWORD>::iterator it = injected_pids.begin(); it != injected_pids.end();) {
+			if (current.find(*it) == current.end()) {
+				LogExtras exit_extras = extras;
+				exit_extras.pid = *it;
+				logger.Log("INFO", "process_exit", "removed", exit_extras);
+				pid_attempts.erase(*it);
+				pid_last_error.erase(*it);
+				it = injected_pids.erase(it);
+			} else {
+				++it;
+			}
+		}
+
+		for (size_t index = 0; index < pids.size(); ++index) {
+			DWORD pid = pids[index];
+			if (injected_pids.find(pid) != injected_pids.end()) {
+				continue;
+			}
+			if (IsModuleLoaded(pid, module_name, settings.dll_path)) {
+				LogExtras loaded_extras = extras;
+				loaded_extras.pid = pid;
+				logger.Log("INFO", "module_check", "already_loaded", loaded_extras);
+				injected_pids.insert(pid);
+				continue;
+			}
+			LogExtras start_extras = extras;
+			start_extras.pid = pid;
+			int total_attempts = 0;
+			std::unordered_map<DWORD, int>::iterator attempt_it = pid_attempts.find(pid);
+			if (attempt_it != pid_attempts.end()) {
+				total_attempts = attempt_it->second;
+			}
+			start_extras.attempt = total_attempts + 1;
+			std::string start_message = "new_process";
+			std::unordered_map<DWORD, std::string>::iterator error_it = pid_last_error.find(pid);
+			if (error_it != pid_last_error.end() && !error_it->second.empty()) {
+				start_message += " last_error=" + error_it->second;
+			}
+			logger.Log("INFO", "inject_start", start_message, start_extras);
+			if (settings.inject_delay_ms > 0) {
+				Sleep(settings.inject_delay_ms);
+			}
+			std::string last_error;
+			bool injected = InjectProcessWithRetries(pid, settings, module_name, logger, &last_error);
+			pid_attempts[pid] = total_attempts + settings.max_retries;
+			pid_last_error[pid] = last_error;
+			if (injected) {
+				injected_pids.insert(pid);
+			}
+		}
+
+		if (settings.exit_when_no_processes && ever_found && pids.empty()) {
+			logger.Log("INFO", "watch_mode", "exit_no_processes", extras);
 			break;
 		}
-		extras.result = "fail";
-		logger.Log("WARN", "inject_result", "retry", extras);
-		if (attempt < settings.max_retries) {
-			Sleep(settings.retry_interval_ms);
-		}
-	}
-
-	if (!injected) {
-		logger.Log("ERROR", "inject_result", "failed", extras);
-		return 1;
+		Sleep(settings.scan_interval_ms);
 	}
 
 	return 0;
