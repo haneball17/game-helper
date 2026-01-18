@@ -268,7 +268,7 @@ static HelperConfig GetDefaultHelperConfig() {
 	config.startup_delay_ms = 0;
 	config.apply_fullscreen_attack_patch = FALSE;
 	config.safe_mode = FALSE;
-	config.wipe_pe_header = FALSE;
+	config.wipe_pe_header = TRUE;
 	config.disable_input_thread = FALSE;
 	config.disable_attract_thread = FALSE;
 	config.output_directory[0] = L'\0';
