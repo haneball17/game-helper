@@ -697,7 +697,7 @@ int wmain(int argc, wchar_t* argv[]) {
 		if (settings.inject_delay_ms > 0) {
 			Sleep(settings.inject_delay_ms);
 		}
-		return InjectProcessWithRetries(pid, settings, module_name, logger) ? 0 : 1;
+		return InjectProcessWithRetries(pid, settings, module_name, logger, NULL) ? 0 : 1;
 	}
 
 	bool ever_found = false;
