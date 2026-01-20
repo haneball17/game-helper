@@ -20,7 +20,8 @@ Refactor the current injection/execution mechanism to utilize **DLL Hijacking** 
 ## 🛠 Tech Stack & Standards
 
 ### General Rules
-* **Language:** All code, variable names, comments, and commit messages must be in **English**.
+* **Language:** All code, variable names, and commit messages must be in **English**.
+* **Comments:** All comments must be in Chinese（已确认，覆盖上一条中对注释语言的限制）。
 * **Documentation:** Functions and complex logic blocks must have concise headers/comments explaining *why*, not just *what*.
 
 ### C++ (Core Logic & DLL Proxy)

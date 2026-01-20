@@ -99,6 +99,17 @@ static const DWORD kFullScreenAttackPatchAddress = 0x00825282;
 // 透明调用地址
 static const DWORD kTransparentCallAddress = 0x011499E0;
 
+// 召唤人偶调用参数（x86）
+static const DWORD kSummonCallParam = 0x0119FEF0;
+// 召唤函数偏移
+static const DWORD kSummonFunctionOffset = 0x354;
+// 召唤位置参数
+static const DWORD kSummonPositionParam = 0x08AE;
+// 召唤默认配置
+static const DWORD kSummonDefaultMonsterId = 25301;
+static const DWORD kSummonDefaultLevel = 70;
+static const DWORD kSummonDefaultCooldownMs = 0;
+
 // // 0625人物基址
 // static const DWORD kPlayerBaseAddress = 0x01AB7CDC;
 
@@ -152,12 +163,19 @@ static const int kAttractModeMonsterOffset80 = 2;
 static const int kAttractModeMonsterOffset150 = 3;
 static const int kAttractModeMonsterOffset300 = 4;
 static const int kAttractModeMax = 4;
-// 怪物 X 坐标偏移配置（索引为配置模式）
-static const float kMonsterXOffsetByMode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0f, 150.0f, 250.0f};
+// 怪物 X 坐标偏移默认配置（索引为配置模式）
+static const float kDefaultMonsterXOffsetByMode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0f, 150.0f, 250.0f};
+static float g_monster_x_offset_by_mode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0f, 150.0f, 250.0f};
 
 static BOOL g_auto_transparent_enabled = FALSE;
 // 自动吸怪配置（0 为关闭）
 static int g_attract_mode = kAttractModeOff;
+// 召唤人偶配置（由配置文件覆盖）
+static BOOL g_summon_enabled = TRUE;
+static DWORD g_summon_monster_id = kSummonDefaultMonsterId;
+static DWORD g_summon_level = kSummonDefaultLevel;
+static DWORD g_summon_cooldown_ms = kSummonDefaultCooldownMs;
+static ULONGLONG g_summon_last_tick = 0;
 // 透明线程
 static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
@@ -257,6 +275,11 @@ struct HelperConfig {
 	BOOL wipe_pe_header;
 	BOOL disable_input_thread;
 	BOOL disable_attract_thread;
+	BOOL enable_summon_doll;
+	DWORD summon_monster_id;
+	DWORD summon_level;
+	DWORD summon_cooldown_ms;
+	float monster_x_offset_by_mode[kAttractModeMax + 1];
 	wchar_t output_directory[MAX_PATH];
 	BOOL output_directory_set;
 };
@@ -269,6 +292,13 @@ static HelperConfig GetDefaultHelperConfig() {
 	config.wipe_pe_header = TRUE;
 	config.disable_input_thread = FALSE;
 	config.disable_attract_thread = FALSE;
+	config.enable_summon_doll = TRUE;
+	config.summon_monster_id = kSummonDefaultMonsterId;
+	config.summon_level = kSummonDefaultLevel;
+	config.summon_cooldown_ms = kSummonDefaultCooldownMs;
+	for (int i = 0; i <= kAttractModeMax; ++i) {
+		config.monster_x_offset_by_mode[i] = kDefaultMonsterXOffsetByMode[i];
+	}
 	config.output_directory[0] = L'\0';
 	config.output_directory_set = FALSE;
 	return config;
@@ -295,6 +325,21 @@ static DWORD ReadIniUInt32(const wchar_t* path, const wchar_t* section, const wc
 		return default_value;
 	}
 	return static_cast<DWORD>(parsed);
+}
+
+// 读取浮点配置，读取失败时回退默认值。
+static float ReadIniFloat(const wchar_t* path, const wchar_t* section, const wchar_t* key, float default_value) {
+	wchar_t buffer[64] = {0};
+	DWORD read = GetPrivateProfileStringW(section, key, L"", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), path);
+	if (read == 0) {
+		return default_value;
+	}
+	wchar_t* end = NULL;
+	double parsed = wcstod(buffer, &end);
+	if (end == buffer) {
+		return default_value;
+	}
+	return static_cast<float>(parsed);
 }
 
 static BOOL ReadIniBool(const wchar_t* path, const wchar_t* section, const wchar_t* key, BOOL default_value) {
@@ -337,6 +382,14 @@ static BOOL LoadHelperConfig(const wchar_t* config_path, HelperConfig* config) {
 	config->wipe_pe_header = ReadIniBool(config_path, L"stealth", L"wipe_pe_header", config->wipe_pe_header);
 	config->disable_input_thread = ReadIniBool(config_path, L"feature", L"disable_input_thread", config->disable_input_thread);
 	config->disable_attract_thread = ReadIniBool(config_path, L"feature", L"disable_attract_thread", config->disable_attract_thread);
+	config->enable_summon_doll = ReadIniBool(config_path, L"feature", L"enable_summon_doll", config->enable_summon_doll);
+	config->summon_monster_id = ReadIniUInt32(config_path, L"feature", L"summon_monster_id", config->summon_monster_id);
+	config->summon_level = ReadIniUInt32(config_path, L"feature", L"summon_level", config->summon_level);
+	config->summon_cooldown_ms = ReadIniUInt32(config_path, L"feature", L"summon_cooldown_ms", config->summon_cooldown_ms);
+	config->monster_x_offset_by_mode[1] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode1", config->monster_x_offset_by_mode[1]);
+	config->monster_x_offset_by_mode[2] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode2", config->monster_x_offset_by_mode[2]);
+	config->monster_x_offset_by_mode[3] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode3", config->monster_x_offset_by_mode[3]);
+	config->monster_x_offset_by_mode[4] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode4", config->monster_x_offset_by_mode[4]);
 	if (ReadIniStringValue(config_path, L"output", L"output_dir", config->output_directory, MAX_PATH)) {
 		config->output_directory_set = TRUE;
 	}
@@ -693,7 +746,7 @@ static void AttractMonstersAndItems(int mode) {
 	}
 	float player_x = ReadFloatSafely(player_ptr + kPositionXOffset);
 	float player_y = ReadFloatSafely(player_ptr + kPositionYOffset);
-	float monster_x = player_x + kMonsterXOffsetByMode[mode];
+	float monster_x = player_x + g_monster_x_offset_by_mode[mode];
 	// 以 end 为结束地址，按指针步进遍历对象
 	for (DWORD cursor = start_ptr; cursor < end_ptr; cursor += 4) {
 		DWORD object_ptr = ReadDwordSafely(cursor);
@@ -739,6 +792,63 @@ static DWORD WINAPI AutoAttractThread(LPVOID param) {
 	return 0;
 }
 
+// 召唤人偶：内联汇编按 CE 脚本顺序压栈调用。
+static BOOL CallSummonDoll(int monster_id, int level) {
+	DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
+	if (player_ptr == 0) {
+		return FALSE;
+	}
+	DWORD vtable = ReadDwordSafely(player_ptr);
+	if (vtable == 0) {
+		return FALSE;
+	}
+	__asm {
+		pushad
+		push 0
+		push 1
+		push kSummonCallParam
+		push 0
+		push 0
+		push -1
+		push 0
+		push 0
+		push 0
+		push 1
+		push 0
+		push 0
+		push kSummonPositionParam
+		push level
+		push 0
+		push monster_id
+		mov esi, player_ptr
+		mov ecx, esi
+		mov edx, [ecx]
+		mov eax, edx
+		add eax, kSummonFunctionOffset
+		mov ebx, [eax]
+		call ebx
+		popad
+	}
+	return TRUE;
+}
+
+// 召唤人偶入口：处理开关与冷却。
+static void TrySummonDoll() {
+	if (!g_summon_enabled) {
+		return;
+	}
+	ULONGLONG now = GetTickCount64();
+	if (g_summon_cooldown_ms > 0 && (now - g_summon_last_tick) < g_summon_cooldown_ms) {
+		return;
+	}
+	if (CallSummonDoll(static_cast<int>(g_summon_monster_id), static_cast<int>(g_summon_level))) {
+		g_summon_last_tick = now;
+		LogEvent("INFO", "summon_doll", "triggered");
+	} else {
+		LogEvent("WARN", "summon_doll", "player_invalid");
+	}
+}
+
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
 static void ToggleAttractMode(int mode, const wchar_t* message);
@@ -748,6 +858,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 	DWORD self_pid = GetCurrentProcessId();
 	bool f2_last_down = false;
 	bool f3_last_down = false;
+	bool f12_last_down = false;
 	bool key7_last_down = false;
 	bool key8_last_down = false;
 	bool key9_last_down = false;
@@ -761,12 +872,14 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 		if (foreground_pid == self_pid) {
 			SHORT f2_state = GetAsyncKeyState(VK_F2);
 			SHORT f3_state = GetAsyncKeyState(VK_F3);
+			SHORT f12_state = GetAsyncKeyState(VK_F12);
 			SHORT key7_state = GetAsyncKeyState('7');
 			SHORT key8_state = GetAsyncKeyState('8');
 			SHORT key9_state = GetAsyncKeyState('9');
 			SHORT key0_state = GetAsyncKeyState('0');
 			bool f2_down = (f2_state & 0x8000) != 0;
 			bool f3_down = (f3_state & 0x8000) != 0;
+			bool f12_down = (f12_state & 0x8000) != 0;
 			bool key7_down = (key7_state & 0x8000) != 0;
 			bool key8_down = (key8_state & 0x8000) != 0;
 			bool key9_down = (key9_state & 0x8000) != 0;
@@ -776,6 +889,9 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			}
 			if (f3_down && !f3_last_down) {
 				ToggleFullscreenAttack();
+			}
+			if (f12_down && !f12_last_down) {
+				TrySummonDoll();
 			}
 			if (key7_down && !key7_last_down) {
 				ToggleAttractMode(kAttractModeAllToPlayer, L"开启吸怪配置1");
@@ -791,6 +907,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
+			f12_last_down = f12_down;
 			key7_last_down = key7_down;
 			key8_last_down = key8_down;
 			key9_last_down = key9_down;
@@ -798,6 +915,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 		} else {
 			f2_last_down = false;
 			f3_last_down = false;
+			f12_last_down = false;
 			key7_last_down = false;
 			key8_last_down = false;
 			key9_last_down = false;
@@ -960,6 +1078,18 @@ static void ToggleAttractMode(int mode, const wchar_t* message) {
 	LogEvent("INFO", "attract_mode", log_message);
 }
 
+// 应用配置到运行时变量，避免线程直接读结构体。
+static void ApplyRuntimeConfig(const HelperConfig& config) {
+	g_summon_enabled = config.enable_summon_doll;
+	g_summon_monster_id = config.summon_monster_id;
+	g_summon_level = config.summon_level;
+	g_summon_cooldown_ms = config.summon_cooldown_ms;
+	g_summon_last_tick = 0;
+	for (int i = 0; i <= kAttractModeMax; ++i) {
+		g_monster_x_offset_by_mode[i] = config.monster_x_offset_by_mode[i];
+	}
+}
+
 static void InitializeHelper(const wchar_t* output_directory, const HelperConfig& config) {
 	if (config.safe_mode) {
 		LogEvent("INFO", "safe_mode", "enabled");
@@ -968,6 +1098,8 @@ static void InitializeHelper(const wchar_t* output_directory, const HelperConfig
 		}
 		return;
 	}
+
+	ApplyRuntimeConfig(config);
 
 	if (config.wipe_pe_header) {
 		if (WipeModuleHeader(g_self_module)) {
@@ -1102,6 +1234,28 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 		config.disable_input_thread,
 		config.disable_attract_thread);
 	LogEvent("INFO", "config_effective", config_message);
+
+	char summon_message[160] = {0};
+	sprintf_s(
+		summon_message,
+		sizeof(summon_message),
+		"enable_summon_doll=%d summon_monster_id=%lu summon_level=%lu summon_cooldown_ms=%lu",
+		config.enable_summon_doll,
+		config.summon_monster_id,
+		config.summon_level,
+		config.summon_cooldown_ms);
+	LogEvent("INFO", "config_summon", summon_message);
+
+	char attract_message[200] = {0};
+	sprintf_s(
+		attract_message,
+		sizeof(attract_message),
+		"monster_x_offset_mode1=%.1f monster_x_offset_mode2=%.1f monster_x_offset_mode3=%.1f monster_x_offset_mode4=%.1f",
+		config.monster_x_offset_by_mode[1],
+		config.monster_x_offset_by_mode[2],
+		config.monster_x_offset_by_mode[3],
+		config.monster_x_offset_by_mode[4]);
+	LogEvent("INFO", "config_attract", attract_message);
 
 	if (output_directory != NULL) {
 		LogEventWithPath("output_directory", output_directory);
