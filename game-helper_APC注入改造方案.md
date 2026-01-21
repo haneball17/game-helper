@@ -99,6 +99,7 @@ output_dir=E:/tools/injector
 - 成功判断：
   - 逻辑成功条件：至少一个线程成功入队；
   - 业务成功条件：检测目标进程已加载 DLL（可选，需外部实现）。
+  - 若 DLL 启用隐藏/擦除头部，可改用 `test_success.txt` 的更新时间作为成功判据。
 - 日志要求：必须输出每一步关键状态与错误码。
 
 ### 6.3 配置文件（建议 INI）
@@ -119,6 +120,9 @@ retry_interval_ms=2000
 module_check_timeout_ms=8000
 module_check_interval_ms=200
 module_check_extend_ms=5000
+success_check_enabled=true
+success_file_name=test_success.txt
+success_file_dir=
 
 [log]
 log_path=./logs/injector.log
@@ -130,6 +134,7 @@ file_output=true
 ```
 
 > 说明：字段名称统一为英文；路径优先使用英文与绝对路径，若 DLL 与注入器同目录可使用 `./GameHelper.dll`（注入器会自动转为绝对路径）。
+> `success_file_name` 支持 `%pid%` 占位符（如 `test_success_%pid%.txt`）。
 
 **放置策略：**
 - 默认读取：`injector.ini` 放在 `HelperStart.exe` 同目录（即 `$(TargetDir)`）。

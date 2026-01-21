@@ -8,10 +8,12 @@
 #include <iostream>
 #include <string.h>
 #include <stdlib.h>
+#include <cwctype>
 
 struct InjectorConfig {
 	std::wstring process_name;
 	std::wstring dll_path;
+	std::vector<std::wstring> dll_paths;
 	DWORD scan_interval_ms;
 	DWORD inject_delay_ms;
 	int max_retries;
@@ -19,6 +21,9 @@ struct InjectorConfig {
 	DWORD module_check_timeout_ms;
 	DWORD module_check_interval_ms;
 	DWORD module_check_extend_ms;
+	bool success_check_enabled;
+	std::wstring success_file_dir;
+	std::wstring success_file_name;
 	bool watch_mode;
 	bool exit_when_no_processes;
 	std::wstring log_path;
@@ -126,6 +131,17 @@ static std::wstring NormalizePath(const std::wstring& path, const std::wstring& 
 	return full_path;
 }
 
+static std::wstring GetDirectoryPath(const std::wstring& path) {
+	if (path.empty()) {
+		return L"";
+	}
+	size_t pos = path.find_last_of(L"\\/");
+	if (pos == std::wstring::npos) {
+		return L"";
+	}
+	return path.substr(0, pos + 1);
+}
+
 static std::wstring GetBaseName(const std::wstring& path) {
 	if (path.empty()) {
 		return L"";
@@ -135,6 +151,114 @@ static std::wstring GetBaseName(const std::wstring& path) {
 		return path;
 	}
 	return path.substr(pos + 1);
+}
+
+static std::wstring TrimWide(const std::wstring& input) {
+	size_t start = 0;
+	while (start < input.size() && iswspace(input[start])) {
+		++start;
+	}
+	size_t end = input.size();
+	while (end > start && iswspace(input[end - 1])) {
+		--end;
+	}
+	return input.substr(start, end - start);
+}
+
+static std::wstring StripQuotes(const std::wstring& input) {
+	if (input.size() >= 2) {
+		wchar_t first = input.front();
+		wchar_t last = input.back();
+		if ((first == L'"' && last == L'"') || (first == L'\'' && last == L'\'')) {
+			return input.substr(1, input.size() - 2);
+		}
+	}
+	return input;
+}
+
+static std::wstring ReplaceAll(const std::wstring& input, const std::wstring& token, const std::wstring& value) {
+	if (token.empty()) {
+		return input;
+	}
+	std::wstring result = input;
+	size_t pos = 0;
+	while ((pos = result.find(token, pos)) != std::wstring::npos) {
+		result.replace(pos, token.size(), value);
+		pos += value.size();
+	}
+	return result;
+}
+
+static bool ContainsPathInsensitive(const std::vector<std::wstring>& items, const std::wstring& value) {
+	for (size_t i = 0; i < items.size(); ++i) {
+		if (_wcsicmp(items[i].c_str(), value.c_str()) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static std::vector<std::wstring> ParseDllPathList(const std::wstring& raw, const std::wstring& base_dir) {
+	// 解析 DLL 列表：支持分号分隔、去空白、去重、相对路径归一化
+	std::vector<std::wstring> results;
+	if (raw.empty()) {
+		return results;
+	}
+	size_t start = 0;
+	while (start <= raw.size()) {
+		size_t pos = raw.find(L';', start);
+		std::wstring item = (pos == std::wstring::npos) ? raw.substr(start) : raw.substr(start, pos - start);
+		item = StripQuotes(TrimWide(item));
+		if (!item.empty()) {
+			std::wstring normalized = NormalizePath(item, base_dir);
+			if (!ContainsPathInsensitive(results, normalized)) {
+				results.push_back(normalized);
+			}
+		}
+		if (pos == std::wstring::npos) {
+			break;
+		}
+		start = pos + 1;
+	}
+	return results;
+}
+
+static std::vector<std::wstring> BuildDllPathList(const std::wstring& multi_value, const std::wstring& single_value, const std::wstring& base_dir) {
+	std::vector<std::wstring> results = ParseDllPathList(multi_value, base_dir);
+	if (!results.empty()) {
+		return results;
+	}
+	std::wstring fallback = TrimWide(single_value);
+	if (fallback.empty()) {
+		fallback = L"GameHelper.dll";
+	}
+	results = ParseDllPathList(fallback, base_dir);
+	if (results.empty()) {
+		results.push_back(NormalizePath(L"GameHelper.dll", base_dir));
+	}
+	return results;
+}
+
+static std::wstring BuildSuccessFilePath(const InjectorConfig& settings, DWORD pid, const std::wstring& dll_path) {
+	if (!settings.success_check_enabled) {
+		return L"";
+	}
+	if (settings.success_file_name.empty()) {
+		return L"";
+	}
+	std::wstring pid_text = std::to_wstring(pid);
+	std::wstring file_name = ReplaceAll(settings.success_file_name, L"%pid%", pid_text);
+	if (IsAbsolutePath(file_name)) {
+		return file_name;
+	}
+	std::wstring base_dir = settings.success_file_dir;
+	if (base_dir.empty()) {
+		base_dir = GetDirectoryPath(dll_path);
+	}
+	if (base_dir.empty()) {
+		return L"";
+	}
+	return JoinPathSafe(base_dir, file_name);
 }
 
 static std::string BuildPidListMessage(const std::vector<DWORD>& pids) {
@@ -384,6 +508,7 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	InjectorConfig settings;
 	settings.process_name = L"dnf.exe";
 	settings.dll_path = L"";
+	settings.dll_paths.clear();
 	settings.scan_interval_ms = 1000;
 	settings.inject_delay_ms = 3000;
 	settings.max_retries = 5;
@@ -391,6 +516,9 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	settings.module_check_timeout_ms = 8000;
 	settings.module_check_interval_ms = 200;
 	settings.module_check_extend_ms = 5000;
+	settings.success_check_enabled = true;
+	settings.success_file_dir = L"";
+	settings.success_file_name = L"test_success.txt";
 	settings.watch_mode = true;
 	settings.exit_when_no_processes = false;
 	settings.log_path = L"injector.jsonl";
@@ -401,33 +529,49 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	*loaded = false;
 
 	DWORD attrs = GetFileAttributesW(config_path.c_str());
-	if (attrs == INVALID_FILE_ATTRIBUTES) {
-		settings.log_path = JoinPathSafe(exe_dir, settings.log_path);
-		return settings;
+	std::wstring dll_path_value;
+	std::wstring dll_paths_value;
+	std::wstring format = L"json";
+
+	if (attrs != INVALID_FILE_ATTRIBUTES) {
+		*loaded = true;
+		settings.process_name = ReadIniStringValue(config_path, L"target", L"process_name", settings.process_name.c_str());
+		dll_path_value = ReadIniStringValue(config_path, L"target", L"dll_path", L"");
+		dll_paths_value = ReadIniStringValue(config_path, L"target", L"dll_paths", L"");
+		DWORD detect_interval = ReadIniUInt32(config_path, L"target", L"detect_interval_ms", settings.scan_interval_ms);
+		settings.scan_interval_ms = ReadIniUInt32(config_path, L"target", L"scan_interval_ms", detect_interval);
+		settings.inject_delay_ms = ReadIniUInt32(config_path, L"target", L"inject_delay_ms", settings.inject_delay_ms);
+		settings.watch_mode = ParseBool(ReadIniStringValue(config_path, L"target", L"watch_mode", settings.watch_mode ? L"true" : L"false"), settings.watch_mode);
+		settings.exit_when_no_processes = ParseBool(ReadIniStringValue(config_path, L"target", L"exit_when_no_processes", settings.exit_when_no_processes ? L"true" : L"false"), settings.exit_when_no_processes);
+		settings.max_retries = static_cast<int>(ReadIniUInt32(config_path, L"apc", L"max_retries", static_cast<DWORD>(settings.max_retries)));
+		settings.retry_interval_ms = ReadIniUInt32(config_path, L"apc", L"retry_interval_ms", settings.retry_interval_ms);
+		settings.module_check_timeout_ms = ReadIniUInt32(config_path, L"apc", L"module_check_timeout_ms", settings.module_check_timeout_ms);
+		settings.module_check_interval_ms = ReadIniUInt32(config_path, L"apc", L"module_check_interval_ms", settings.module_check_interval_ms);
+		settings.module_check_extend_ms = ReadIniUInt32(config_path, L"apc", L"module_check_extend_ms", settings.module_check_extend_ms);
+		settings.success_check_enabled = ParseBool(
+			ReadIniStringValue(config_path, L"apc", L"success_check_enabled", settings.success_check_enabled ? L"true" : L"false"),
+			settings.success_check_enabled);
+		std::wstring success_file_dir_value = TrimWide(ReadIniStringValue(config_path, L"apc", L"success_file_dir", L""));
+		if (!success_file_dir_value.empty()) {
+			settings.success_file_dir = NormalizePath(success_file_dir_value, exe_dir);
+		}
+		std::wstring success_file_name_value = TrimWide(ReadIniStringValue(config_path, L"apc", L"success_file_name", settings.success_file_name.c_str()));
+		if (!success_file_name_value.empty()) {
+			settings.success_file_name = success_file_name_value;
+		}
+		settings.log_path = ReadIniStringValue(config_path, L"log", L"log_path", settings.log_path.c_str());
+		settings.log_level = WideToUtf8(ReadIniStringValue(config_path, L"log", L"log_level", L"INFO"));
+		format = ReadIniStringValue(config_path, L"log", L"log_format", L"json");
+		settings.log_pid_list = ParseBool(ReadIniStringValue(config_path, L"log", L"log_pid_list", L"false"), settings.log_pid_list);
+		settings.console_output = ParseBool(ReadIniStringValue(config_path, L"log", L"console_output", L"true"), true);
+		settings.file_output = ParseBool(ReadIniStringValue(config_path, L"log", L"file_output", L"true"), true);
 	}
-	*loaded = true;
 
-	settings.process_name = ReadIniStringValue(config_path, L"target", L"process_name", settings.process_name.c_str());
-	settings.dll_path = ReadIniStringValue(config_path, L"target", L"dll_path", settings.dll_path.c_str());
-	DWORD detect_interval = ReadIniUInt32(config_path, L"target", L"detect_interval_ms", settings.scan_interval_ms);
-	settings.scan_interval_ms = ReadIniUInt32(config_path, L"target", L"scan_interval_ms", detect_interval);
-	settings.inject_delay_ms = ReadIniUInt32(config_path, L"target", L"inject_delay_ms", settings.inject_delay_ms);
-	settings.watch_mode = ParseBool(ReadIniStringValue(config_path, L"target", L"watch_mode", settings.watch_mode ? L"true" : L"false"), settings.watch_mode);
-	settings.exit_when_no_processes = ParseBool(ReadIniStringValue(config_path, L"target", L"exit_when_no_processes", settings.exit_when_no_processes ? L"true" : L"false"), settings.exit_when_no_processes);
-	settings.max_retries = static_cast<int>(ReadIniUInt32(config_path, L"apc", L"max_retries", static_cast<DWORD>(settings.max_retries)));
-	settings.retry_interval_ms = ReadIniUInt32(config_path, L"apc", L"retry_interval_ms", settings.retry_interval_ms);
-	settings.module_check_timeout_ms = ReadIniUInt32(config_path, L"apc", L"module_check_timeout_ms", settings.module_check_timeout_ms);
-	settings.module_check_interval_ms = ReadIniUInt32(config_path, L"apc", L"module_check_interval_ms", settings.module_check_interval_ms);
-	settings.module_check_extend_ms = ReadIniUInt32(config_path, L"apc", L"module_check_extend_ms", settings.module_check_extend_ms);
-	settings.log_path = ReadIniStringValue(config_path, L"log", L"log_path", settings.log_path.c_str());
-	settings.log_level = WideToUtf8(ReadIniStringValue(config_path, L"log", L"log_level", L"INFO"));
-	std::wstring format = ReadIniStringValue(config_path, L"log", L"log_format", L"json");
-	settings.log_pid_list = ParseBool(ReadIniStringValue(config_path, L"log", L"log_pid_list", L"false"), settings.log_pid_list);
-	settings.console_output = ParseBool(ReadIniStringValue(config_path, L"log", L"console_output", L"true"), true);
-	settings.file_output = ParseBool(ReadIniStringValue(config_path, L"log", L"file_output", L"true"), true);
-
-	// DLL 相对路径统一转为注入器目录下的绝对路径，避免目标进程工作目录不一致导致加载失败。
-	settings.dll_path = NormalizePath(settings.dll_path, exe_dir);
+	// DLL 列表优先：dll_paths -> dll_path -> 默认 GameHelper.dll
+	settings.dll_paths = BuildDllPathList(dll_paths_value, dll_path_value, exe_dir);
+	if (!settings.dll_paths.empty()) {
+		settings.dll_path = settings.dll_paths.front();
+	}
 	if (settings.module_check_interval_ms == 0) {
 		settings.module_check_interval_ms = 200;
 	}
@@ -499,6 +643,48 @@ static std::vector<DWORD> ListThreadIds(DWORD pid) {
 	return threads;
 }
 
+enum ModuleCheckResult {
+	kModuleCheckTimeout = 0,
+	kModuleCheckModuleLoaded = 1,
+	kModuleCheckSuccessFile = 2
+};
+
+static bool GetFileWriteTime(const std::wstring& path, FILETIME* write_time) {
+	if (write_time == NULL) {
+		return false;
+	}
+	HANDLE file = CreateFileW(
+		path.c_str(),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+	if (file == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	FILETIME file_write_time = {0};
+	BOOL ok = GetFileTime(file, NULL, NULL, &file_write_time);
+	CloseHandle(file);
+	if (!ok) {
+		return false;
+	}
+	*write_time = file_write_time;
+	return true;
+}
+
+static bool HasFileUpdated(const std::wstring& path, bool baseline_valid, const FILETIME& baseline_time) {
+	FILETIME current_time = {0};
+	if (!GetFileWriteTime(path, &current_time)) {
+		return false;
+	}
+	if (!baseline_valid) {
+		return true;
+	}
+	return CompareFileTime(&current_time, &baseline_time) == 1;
+}
+
 static bool IsModuleLoaded(DWORD pid, const std::wstring& module_name, const std::wstring& module_path) {
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
 	if (snapshot == INVALID_HANDLE_VALUE) {
@@ -520,26 +706,37 @@ static bool IsModuleLoaded(DWORD pid, const std::wstring& module_name, const std
 	return found;
 }
 
-static bool WaitForModuleLoaded(DWORD pid, const std::wstring& module_name, const std::wstring& module_path, DWORD timeout_ms, DWORD interval_ms) {
+// 同时检测模块加载与成功文件更新，兼容隐藏模块场景。
+static ModuleCheckResult WaitForModuleOrSuccess(DWORD pid,
+	const std::wstring& module_name,
+	const std::wstring& module_path,
+	const std::wstring& success_file_path,
+	bool success_baseline_valid,
+	const FILETIME& success_baseline,
+	DWORD timeout_ms,
+	DWORD interval_ms) {
 	ULONGLONG start = GetTickCount64();
 	for (;;) {
 		if (IsModuleLoaded(pid, module_name, module_path)) {
-			return true;
+			return kModuleCheckModuleLoaded;
+		}
+		if (!success_file_path.empty() && HasFileUpdated(success_file_path, success_baseline_valid, success_baseline)) {
+			return kModuleCheckSuccessFile;
 		}
 		if (GetTickCount64() - start >= timeout_ms) {
-			return false;
+			return kModuleCheckTimeout;
 		}
 		Sleep(interval_ms);
 	}
 }
 
-static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::wstring& module_name, JsonLogger& logger, int attempt) {
+static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::wstring& dll_path, const std::wstring& module_name, JsonLogger& logger, int attempt) {
 	// APC 注入核心流程：远程写入路径 + QueueUserAPC
 	LogExtras extras;
 	extras.pid = pid;
 	extras.attempt = attempt;
 	extras.process_name = settings.process_name;
-	extras.dll_path = settings.dll_path;
+	extras.dll_path = dll_path;
 
 	HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
 	if (process == NULL) {
@@ -548,7 +745,7 @@ static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::ws
 		return false;
 	}
 
-	size_t bytes = (settings.dll_path.size() + 1) * sizeof(wchar_t);
+	size_t bytes = (dll_path.size() + 1) * sizeof(wchar_t);
 	void* remote_path = VirtualAllocEx(process, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if (remote_path == NULL) {
 		extras.error_code = GetLastError();
@@ -557,7 +754,7 @@ static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::ws
 		return false;
 	}
 
-	if (!WriteProcessMemory(process, remote_path, settings.dll_path.c_str(), bytes, NULL)) {
+	if (!WriteProcessMemory(process, remote_path, dll_path.c_str(), bytes, NULL)) {
 		extras.error_code = GetLastError();
 		logger.Log("ERROR", "write_remote", "failed", extras);
 		VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
@@ -573,6 +770,14 @@ static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::ws
 		VirtualFreeEx(process, remote_path, 0, MEM_RELEASE);
 		CloseHandle(process);
 		return false;
+	}
+
+	// 记录成功文件基线，模块隐藏时用于判断是否已执行注入逻辑。
+	std::wstring success_file_path = BuildSuccessFilePath(settings, pid, dll_path);
+	FILETIME success_baseline = {0};
+	bool success_baseline_valid = false;
+	if (!success_file_path.empty()) {
+		success_baseline_valid = GetFileWriteTime(success_file_path, &success_baseline);
 	}
 
 	std::vector<DWORD> threads = ListThreadIds(pid);
@@ -598,29 +803,51 @@ static bool InjectByApc(DWORD pid, const InjectorConfig& settings, const std::ws
 	}
 
 	logger.Log("INFO", "module_check", "start", extras);
-	bool loaded = WaitForModuleLoaded(pid, module_name, settings.dll_path, settings.module_check_timeout_ms, settings.module_check_interval_ms);
-	if (!loaded && settings.module_check_extend_ms > 0) {
+	ModuleCheckResult check_result = WaitForModuleOrSuccess(
+		pid,
+		module_name,
+		dll_path,
+		success_file_path,
+		success_baseline_valid,
+		success_baseline,
+		settings.module_check_timeout_ms,
+		settings.module_check_interval_ms);
+	if (check_result == kModuleCheckTimeout && settings.module_check_extend_ms > 0) {
 		char extend_message[64] = {0};
 		sprintf_s(extend_message, "extend_ms=%lu", settings.module_check_extend_ms);
 		logger.Log("WARN", "module_check_extend", extend_message, extras);
-		loaded = WaitForModuleLoaded(pid, module_name, settings.dll_path, settings.module_check_extend_ms, settings.module_check_interval_ms);
+		check_result = WaitForModuleOrSuccess(
+			pid,
+			module_name,
+			dll_path,
+			success_file_path,
+			success_baseline_valid,
+			success_baseline,
+			settings.module_check_extend_ms,
+			settings.module_check_interval_ms);
 	}
-	logger.Log(loaded ? "INFO" : "WARN", "module_check", loaded ? "loaded" : "timeout", extras);
+	const char* check_message = "timeout";
+	if (check_result == kModuleCheckModuleLoaded) {
+		check_message = "loaded";
+	} else if (check_result == kModuleCheckSuccessFile) {
+		check_message = "success_file";
+	}
+	logger.Log(check_result == kModuleCheckTimeout ? "WARN" : "INFO", "module_check", check_message, extras);
 
 	CloseHandle(process);
-	return loaded;
+	return check_result != kModuleCheckTimeout;
 }
 
-static bool InjectProcessWithRetries(DWORD pid, const InjectorConfig& settings, const std::wstring& module_name, JsonLogger& logger, std::string* last_error) {
+static bool InjectProcessWithRetries(DWORD pid, const InjectorConfig& settings, const std::wstring& dll_path, const std::wstring& module_name, JsonLogger& logger, std::string* last_error) {
 	LogExtras extras;
 	extras.pid = pid;
 	extras.process_name = settings.process_name;
-	extras.dll_path = settings.dll_path;
+	extras.dll_path = dll_path;
 
 	for (int attempt = 1; attempt <= settings.max_retries; ++attempt) {
 		extras.attempt = attempt;
 		extras.result = "fail";
-		if (InjectByApc(pid, settings, module_name, logger, attempt)) {
+		if (InjectByApc(pid, settings, dll_path, module_name, logger, attempt)) {
 			extras.result = "ok";
 			logger.Log("INFO", "inject_result", "success", extras);
 			if (last_error != NULL) {
@@ -667,20 +894,31 @@ int wmain(int argc, wchar_t* argv[]) {
 		logger.Log("ERROR", "config", "process_name_empty", extras);
 		return 1;
 	}
-	if (settings.dll_path.empty()) {
+	if (settings.dll_paths.empty()) {
 		logger.Log("ERROR", "config", "dll_path_empty", extras);
 		return 1;
 	}
-	DWORD dll_attrs = GetFileAttributesW(settings.dll_path.c_str());
-	if (dll_attrs == INVALID_FILE_ATTRIBUTES || (dll_attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-		logger.Log("ERROR", "config", "dll_path_invalid", extras);
-		return 1;
-	}
-
-	std::wstring module_name = GetBaseName(settings.dll_path);
-	if (module_name.empty()) {
-		logger.Log("ERROR", "config", "module_name_empty", extras);
-		return 1;
+	std::vector<std::wstring> module_names;
+	module_names.reserve(settings.dll_paths.size());
+	for (size_t i = 0; i < settings.dll_paths.size(); ++i) {
+		const std::wstring& dll_path = settings.dll_paths[i];
+		LogExtras path_extras = extras;
+		path_extras.dll_path = dll_path;
+		if (dll_path.empty()) {
+			logger.Log("ERROR", "config", "dll_path_empty", path_extras);
+			return 1;
+		}
+		DWORD dll_attrs = GetFileAttributesW(dll_path.c_str());
+		if (dll_attrs == INVALID_FILE_ATTRIBUTES || (dll_attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+			logger.Log("ERROR", "config", "dll_path_invalid", path_extras);
+			return 1;
+		}
+		std::wstring module_name = GetBaseName(dll_path);
+		if (module_name.empty()) {
+			logger.Log("ERROR", "config", "module_name_empty", path_extras);
+			return 1;
+		}
+		module_names.push_back(module_name);
 	}
 
 	if (!settings.watch_mode) {
@@ -697,7 +935,17 @@ int wmain(int argc, wchar_t* argv[]) {
 		if (settings.inject_delay_ms > 0) {
 			Sleep(settings.inject_delay_ms);
 		}
-		return InjectProcessWithRetries(pid, settings, module_name, logger, NULL) ? 0 : 1;
+		bool all_injected = true;
+		for (size_t i = 0; i < settings.dll_paths.size(); ++i) {
+			LogExtras start_extras = extras;
+			start_extras.pid = pid;
+			start_extras.dll_path = settings.dll_paths[i];
+			logger.Log("INFO", "inject_start", "single_process", start_extras);
+			if (!InjectProcessWithRetries(pid, settings, settings.dll_paths[i], module_names[i], logger, NULL)) {
+				all_injected = false;
+			}
+		}
+		return all_injected ? 0 : 1;
 	}
 
 	bool ever_found = false;
@@ -738,7 +986,13 @@ int wmain(int argc, wchar_t* argv[]) {
 			if (injected_pids.find(pid) != injected_pids.end()) {
 				continue;
 			}
-			if (IsModuleLoaded(pid, module_name, settings.dll_path)) {
+			std::vector<size_t> missing_indices;
+			for (size_t i = 0; i < settings.dll_paths.size(); ++i) {
+				if (!IsModuleLoaded(pid, module_names[i], settings.dll_paths[i])) {
+					missing_indices.push_back(i);
+				}
+			}
+			if (missing_indices.empty()) {
 				LogExtras loaded_extras = extras;
 				loaded_extras.pid = pid;
 				logger.Log("INFO", "module_check", "already_loaded", loaded_extras);
@@ -747,6 +1001,7 @@ int wmain(int argc, wchar_t* argv[]) {
 			}
 			LogExtras start_extras = extras;
 			start_extras.pid = pid;
+			start_extras.dll_path = L"";
 			int total_attempts = 0;
 			std::unordered_map<DWORD, int>::iterator attempt_it = pid_attempts.find(pid);
 			if (attempt_it != pid_attempts.end()) {
@@ -754,6 +1009,7 @@ int wmain(int argc, wchar_t* argv[]) {
 			}
 			start_extras.attempt = total_attempts + 1;
 			std::string start_message = "new_process";
+			start_message += " dll_count=" + std::to_string(missing_indices.size());
 			std::unordered_map<DWORD, std::string>::iterator error_it = pid_last_error.find(pid);
 			if (error_it != pid_last_error.end() && !error_it->second.empty()) {
 				start_message += " last_error=" + error_it->second;
@@ -762,11 +1018,25 @@ int wmain(int argc, wchar_t* argv[]) {
 			if (settings.inject_delay_ms > 0) {
 				Sleep(settings.inject_delay_ms);
 			}
+			bool all_injected = true;
 			std::string last_error;
-			bool injected = InjectProcessWithRetries(pid, settings, module_name, logger, &last_error);
-			pid_attempts[pid] = total_attempts + settings.max_retries;
-			pid_last_error[pid] = last_error;
-			if (injected) {
+			for (size_t i = 0; i < missing_indices.size(); ++i) {
+				size_t target_index = missing_indices[i];
+				std::string dll_error;
+				bool injected = InjectProcessWithRetries(pid, settings, settings.dll_paths[target_index], module_names[target_index], logger, &dll_error);
+				total_attempts += settings.max_retries;
+				if (!injected) {
+					all_injected = false;
+					if (!dll_error.empty()) {
+						last_error = dll_error;
+					}
+				}
+			}
+			pid_attempts[pid] = total_attempts;
+			if (!last_error.empty()) {
+				pid_last_error[pid] = last_error;
+			}
+			if (all_injected) {
 				injected_pids.insert(pid);
 			}
 		}
