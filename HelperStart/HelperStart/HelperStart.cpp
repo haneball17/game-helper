@@ -153,6 +153,18 @@ static std::wstring GetBaseName(const std::wstring& path) {
 	return path.substr(pos + 1);
 }
 
+static std::wstring GetBaseNameWithoutExtension(const std::wstring& path) {
+	std::wstring base_name = GetBaseName(path);
+	if (base_name.empty()) {
+		return L"";
+	}
+	size_t dot = base_name.find_last_of(L'.');
+	if (dot == std::wstring::npos) {
+		return base_name;
+	}
+	return base_name.substr(0, dot);
+}
+
 static std::wstring TrimWide(const std::wstring& input) {
 	size_t start = 0;
 	while (start < input.size() && iswspace(input[start])) {
@@ -243,11 +255,20 @@ static std::wstring BuildSuccessFilePath(const InjectorConfig& settings, DWORD p
 	if (!settings.success_check_enabled) {
 		return L"";
 	}
-	if (settings.success_file_name.empty()) {
+	std::wstring file_name = settings.success_file_name;
+	if (file_name.empty()) {
+		file_name = L"successfile_%dll.name%_%pid%.txt";
+	}
+	std::wstring dll_name = GetBaseNameWithoutExtension(dll_path);
+	if (dll_name.empty()) {
 		return L"";
 	}
 	std::wstring pid_text = std::to_wstring(pid);
-	std::wstring file_name = ReplaceAll(settings.success_file_name, L"%pid%", pid_text);
+	file_name = ReplaceAll(file_name, L"%pid%", pid_text);
+	file_name = ReplaceAll(file_name, L"%dll.name%", dll_name);
+	if (file_name.empty()) {
+		return L"";
+	}
 	if (IsAbsolutePath(file_name)) {
 		return file_name;
 	}
@@ -259,6 +280,15 @@ static std::wstring BuildSuccessFilePath(const InjectorConfig& settings, DWORD p
 		return L"";
 	}
 	return JoinPathSafe(base_dir, file_name);
+}
+
+static bool IsSuccessFilePresent(const InjectorConfig& settings, DWORD pid, const std::wstring& dll_path) {
+	std::wstring success_file_path = BuildSuccessFilePath(settings, pid, dll_path);
+	if (success_file_path.empty()) {
+		return false;
+	}
+	DWORD attrs = GetFileAttributesW(success_file_path.c_str());
+	return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
 static std::string BuildPidListMessage(const std::vector<DWORD>& pids) {
@@ -503,6 +533,35 @@ private:
 	HANDLE file_;
 };
 
+static void DeleteSuccessFilesForPid(const InjectorConfig& settings,
+	DWORD pid,
+	const std::vector<std::wstring>& dll_paths,
+	JsonLogger& logger,
+	const LogExtras& base_extras) {
+	if (!settings.success_check_enabled) {
+		return;
+	}
+	for (size_t i = 0; i < dll_paths.size(); ++i) {
+		const std::wstring& dll_path = dll_paths[i];
+		std::wstring success_file_path = BuildSuccessFilePath(settings, pid, dll_path);
+		if (success_file_path.empty()) {
+			continue;
+		}
+		DWORD attrs = GetFileAttributesW(success_file_path.c_str());
+		if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+			continue;
+		}
+		LogExtras delete_extras = base_extras;
+		delete_extras.dll_path = dll_path;
+		if (DeleteFileW(success_file_path.c_str()) != 0) {
+			logger.Log("INFO", "success_file_cleanup", "deleted", delete_extras);
+		} else {
+			delete_extras.error_code = GetLastError();
+			logger.Log("WARN", "success_file_cleanup", "delete_failed", delete_extras);
+		}
+	}
+}
+
 static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const std::wstring& exe_dir, bool* loaded) {
 	// 读取 INI 配置，缺省值直接生效
 	InjectorConfig settings;
@@ -518,7 +577,7 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	settings.module_check_extend_ms = 5000;
 	settings.success_check_enabled = true;
 	settings.success_file_dir = L"";
-	settings.success_file_name = L"test_success.txt";
+	settings.success_file_name = L"successfile_%dll.name%_%pid%.txt";
 	settings.watch_mode = true;
 	settings.exit_when_no_processes = false;
 	settings.log_path = L"injector.jsonl";
@@ -952,6 +1011,8 @@ int wmain(int argc, wchar_t* argv[]) {
 	std::unordered_set<DWORD> injected_pids;
 	std::unordered_map<DWORD, int> pid_attempts;
 	std::unordered_map<DWORD, std::string> pid_last_error;
+	std::unordered_map<DWORD, std::unordered_set<size_t>> pid_injected_modules;
+	std::unordered_map<DWORD, std::unordered_map<size_t, ULONGLONG>> pid_cooldowns;
 	std::string last_pid_hash;
 	logger.Log("INFO", "watch_mode", "start", extras);
 	for (;;) {
@@ -973,8 +1034,12 @@ int wmain(int argc, wchar_t* argv[]) {
 				LogExtras exit_extras = extras;
 				exit_extras.pid = *it;
 				logger.Log("INFO", "process_exit", "removed", exit_extras);
+				// 进程退出时清理对应的成功文件。
+				DeleteSuccessFilesForPid(settings, *it, settings.dll_paths, logger, exit_extras);
 				pid_attempts.erase(*it);
 				pid_last_error.erase(*it);
+				pid_injected_modules.erase(*it);
+				pid_cooldowns.erase(*it);
 				it = injected_pids.erase(it);
 			} else {
 				++it;
@@ -986,17 +1051,37 @@ int wmain(int argc, wchar_t* argv[]) {
 			if (injected_pids.find(pid) != injected_pids.end()) {
 				continue;
 			}
+			std::unordered_set<size_t>& injected_modules = pid_injected_modules[pid];
+			std::unordered_map<size_t, ULONGLONG>& cooldowns = pid_cooldowns[pid];
 			std::vector<size_t> missing_indices;
+			std::vector<size_t> pending_indices;
+			ULONGLONG now = GetTickCount64();
 			for (size_t i = 0; i < settings.dll_paths.size(); ++i) {
-				if (!IsModuleLoaded(pid, module_names[i], settings.dll_paths[i])) {
-					missing_indices.push_back(i);
+				if (injected_modules.find(i) != injected_modules.end()) {
+					continue;
 				}
+				if (IsModuleLoaded(pid, module_names[i], settings.dll_paths[i]) ||
+					IsSuccessFilePresent(settings, pid, settings.dll_paths[i])) {
+					injected_modules.insert(i);
+					continue;
+				}
+				missing_indices.push_back(i);
+				if (settings.retry_interval_ms > 0) {
+					std::unordered_map<size_t, ULONGLONG>::iterator cooldown_it = cooldowns.find(i);
+					if (cooldown_it != cooldowns.end() && cooldown_it->second > now) {
+						continue;
+					}
+				}
+				pending_indices.push_back(i);
 			}
 			if (missing_indices.empty()) {
 				LogExtras loaded_extras = extras;
 				loaded_extras.pid = pid;
 				logger.Log("INFO", "module_check", "already_loaded", loaded_extras);
 				injected_pids.insert(pid);
+				continue;
+			}
+			if (pending_indices.empty()) {
 				continue;
 			}
 			LogExtras start_extras = extras;
@@ -1010,6 +1095,9 @@ int wmain(int argc, wchar_t* argv[]) {
 			start_extras.attempt = total_attempts + 1;
 			std::string start_message = "new_process";
 			start_message += " dll_count=" + std::to_string(missing_indices.size());
+			if (pending_indices.size() != missing_indices.size()) {
+				start_message += " pending=" + std::to_string(pending_indices.size());
+			}
 			std::unordered_map<DWORD, std::string>::iterator error_it = pid_last_error.find(pid);
 			if (error_it != pid_last_error.end() && !error_it->second.empty()) {
 				start_message += " last_error=" + error_it->second;
@@ -1018,25 +1106,29 @@ int wmain(int argc, wchar_t* argv[]) {
 			if (settings.inject_delay_ms > 0) {
 				Sleep(settings.inject_delay_ms);
 			}
-			bool all_injected = true;
 			std::string last_error;
-			for (size_t i = 0; i < missing_indices.size(); ++i) {
-				size_t target_index = missing_indices[i];
+			for (size_t i = 0; i < pending_indices.size(); ++i) {
+				size_t target_index = pending_indices[i];
 				std::string dll_error;
+				ULONGLONG attempt_time = GetTickCount64();
+				if (settings.retry_interval_ms > 0) {
+					cooldowns[target_index] = attempt_time + settings.retry_interval_ms;
+				}
 				bool injected = InjectProcessWithRetries(pid, settings, settings.dll_paths[target_index], module_names[target_index], logger, &dll_error);
 				total_attempts += settings.max_retries;
-				if (!injected) {
-					all_injected = false;
-					if (!dll_error.empty()) {
-						last_error = dll_error;
-					}
+				if (injected) {
+					injected_modules.insert(target_index);
+					continue;
+				}
+				if (!dll_error.empty()) {
+					last_error = dll_error;
 				}
 			}
 			pid_attempts[pid] = total_attempts;
 			if (!last_error.empty()) {
 				pid_last_error[pid] = last_error;
 			}
-			if (all_injected) {
+			if (injected_modules.size() == settings.dll_paths.size()) {
 				injected_pids.insert(pid);
 			}
 		}

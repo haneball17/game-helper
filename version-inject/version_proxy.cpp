@@ -228,6 +228,30 @@ static BOOL GetModuleDirectory(HMODULE module, wchar_t* directory_path, size_t d
 	return wcscpy_s(directory_path, directory_capacity, module_path) == 0;
 }
 
+static BOOL GetModuleBaseName(HMODULE module, wchar_t* output, size_t output_capacity) {
+	if (module == NULL || output == NULL || output_capacity == 0) {
+		return FALSE;
+	}
+	wchar_t module_path[MAX_PATH] = {0};
+	DWORD length = GetModuleFileNameW(module, module_path, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH) {
+		return FALSE;
+	}
+	const wchar_t* file_name = wcsrchr(module_path, L'\\');
+	if (file_name == NULL) {
+		file_name = wcsrchr(module_path, L'/');
+	}
+	file_name = (file_name != NULL) ? (file_name + 1) : module_path;
+	if (wcscpy_s(output, output_capacity, file_name) != 0) {
+		return FALSE;
+	}
+	wchar_t* dot = wcsrchr(output, L'.');
+	if (dot != NULL) {
+		*dot = L'\0';
+	}
+	return output[0] != L'\0';
+}
+
 static BOOL BuildLogPath(const wchar_t* directory_path, wchar_t* output, size_t output_capacity) {
 	if (directory_path == NULL || directory_path[0] == L'\0') {
 		return FALSE;
@@ -266,6 +290,40 @@ static BOOL BuildConfigPath(const wchar_t* directory_path, wchar_t* output, size
 		}
 	}
 	return wcscat_s(output, output_capacity, kConfigFileName) == 0;
+}
+
+static BOOL BuildSuccessFilePath(const wchar_t* directory_path,
+	const wchar_t* dll_base_name,
+	DWORD pid,
+	wchar_t* output,
+	size_t output_capacity) {
+	if (directory_path == NULL || directory_path[0] == L'\0' ||
+		dll_base_name == NULL || dll_base_name[0] == L'\0') {
+		return FALSE;
+	}
+	if (wcscpy_s(output, output_capacity, directory_path) != 0) {
+		return FALSE;
+	}
+	size_t length = wcslen(output);
+	if (length == 0 || length >= output_capacity - 1) {
+		return FALSE;
+	}
+	wchar_t last = output[length - 1];
+	if (last != L'\\' && last != L'/') {
+		if (wcscat_s(output, output_capacity, L"\\") != 0) {
+			return FALSE;
+		}
+	}
+	wchar_t file_name[128] = {0};
+	// 成功文件命名：successfile_%dll.name%_%pid%.txt
+	if (swprintf_s(file_name,
+		sizeof(file_name) / sizeof(file_name[0]),
+		L"successfile_%s_%lu.txt",
+		dll_base_name,
+		pid) <= 0) {
+		return FALSE;
+	}
+	return wcscat_s(output, output_capacity, file_name) == 0;
 }
 
 struct HelperConfig {
@@ -943,11 +1001,12 @@ static void CallTransparent(DWORD player_ptr) {
 
 // 写入劫持成功标记文件，文件内容为当前时间。
 static BOOL WriteSuccessFile(const wchar_t* directory_path) {
-	wchar_t file_path[MAX_PATH] = {0};
-	if (wcscpy_s(file_path, MAX_PATH, directory_path) != 0) {
+	wchar_t dll_base_name[MAX_PATH] = {0};
+	if (!GetModuleBaseName(g_self_module, dll_base_name, MAX_PATH)) {
 		return FALSE;
 	}
-	if (wcscat_s(file_path, MAX_PATH, L"test_success.txt") != 0) {
+	wchar_t file_path[MAX_PATH] = {0};
+	if (!BuildSuccessFilePath(directory_path, dll_base_name, GetCurrentProcessId(), file_path, MAX_PATH)) {
 		return FALSE;
 	}
 

@@ -4,6 +4,7 @@ You are an expert Game Automation Developer and System Architect specializing in
 
 ## 📌 范围说明
 * 仅聚焦 `version-inject` 目录下的开发，其余目录仅作参考资料。
+* 允许调整 `HelperStart/HelperStart/HelperStart.cpp` 注入器逻辑，默认复用 `retry_interval_ms` 作为冷却窗口。
 
 ## 📌 版本数据约束
 * 当前版本必须使用你确认的基址/偏移（人物基址 `0x1AC790C`、地图偏移 `0xB8`、类型偏移 `0x94`、坐标偏移 `0x18C/0x190/0x194` 等）。
