@@ -170,6 +170,8 @@ static float g_monster_x_offset_by_mode[kAttractModeMax + 1] = {0.0f, 0.0f, 80.0
 static BOOL g_auto_transparent_enabled = FALSE;
 // 自动吸怪配置（0 为关闭）
 static int g_attract_mode = kAttractModeOff;
+// 吸怪方向开关（TRUE=正向，FALSE=负向）
+static BOOL g_attract_positive_enabled = FALSE;
 // 召唤人偶配置（由配置文件覆盖）
 static BOOL g_summon_enabled = TRUE;
 static DWORD g_summon_monster_id = kSummonDefaultMonsterId;
@@ -804,7 +806,13 @@ static void AttractMonstersAndItems(int mode) {
 	}
 	float player_x = ReadFloatSafely(player_ptr + kPositionXOffset);
 	float player_y = ReadFloatSafely(player_ptr + kPositionYOffset);
-	float monster_x = player_x + g_monster_x_offset_by_mode[mode];
+	float offset = g_monster_x_offset_by_mode[mode];
+	if (offset < 0.0f) {
+		offset = -offset;
+	}
+	// 方向开关生效：正向为 +，负向为 -。
+	float direction = g_attract_positive_enabled ? 1.0f : -1.0f;
+	float monster_x = player_x + offset * direction;
 	// 以 end 为结束地址，按指针步进遍历对象
 	for (DWORD cursor = start_ptr; cursor < end_ptr; cursor += 4) {
 		DWORD object_ptr = ReadDwordSafely(cursor);
@@ -910,6 +918,7 @@ static void TrySummonDoll() {
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
 static void ToggleAttractMode(int mode, const wchar_t* message);
+static void ToggleAttractDirection();
 
 static DWORD WINAPI InputPollThread(LPVOID param) {
 	UNREFERENCED_PARAMETER(param);
@@ -921,6 +930,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 	bool key8_last_down = false;
 	bool key9_last_down = false;
 	bool key0_last_down = false;
+	bool minus_last_down = false;
 	while (TRUE) {
 		HWND foreground = GetForegroundWindow();
 		DWORD foreground_pid = 0;
@@ -935,6 +945,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			SHORT key8_state = GetAsyncKeyState('8');
 			SHORT key9_state = GetAsyncKeyState('9');
 			SHORT key0_state = GetAsyncKeyState('0');
+			SHORT minus_state = GetAsyncKeyState(VK_OEM_MINUS);
 			bool f2_down = (f2_state & 0x8000) != 0;
 			bool f3_down = (f3_state & 0x8000) != 0;
 			bool f12_down = (f12_state & 0x8000) != 0;
@@ -942,6 +953,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			bool key8_down = (key8_state & 0x8000) != 0;
 			bool key9_down = (key9_state & 0x8000) != 0;
 			bool key0_down = (key0_state & 0x8000) != 0;
+			bool minus_down = (minus_state & 0x8000) != 0;
 			if (f2_down && !f2_last_down) {
 				ToggleAutoTransparent();
 			}
@@ -963,6 +975,9 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			if (key0_down && !key0_last_down) {
 				ToggleAttractMode(kAttractModeMonsterOffset300, L"开启吸怪配置4");
 			}
+			if (minus_down && !minus_last_down) {
+				ToggleAttractDirection();
+			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
 			f12_last_down = f12_down;
@@ -970,6 +985,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			key8_last_down = key8_down;
 			key9_last_down = key9_down;
 			key0_last_down = key0_down;
+			minus_last_down = minus_down;
 		} else {
 			f2_last_down = false;
 			f3_last_down = false;
@@ -978,6 +994,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			key8_last_down = false;
 			key9_last_down = false;
 			key0_last_down = false;
+			minus_last_down = false;
 		}
 		Sleep(kInputPollIntervalMs);
 	}
@@ -1135,6 +1152,18 @@ static void ToggleAttractMode(int mode, const wchar_t* message) {
 	char log_message[64] = {0};
 	sprintf_s(log_message, sizeof(log_message), "mode=%d", g_attract_mode);
 	LogEvent("INFO", "attract_mode", log_message);
+}
+
+// 吸怪方向切换：正向/负向。
+static void ToggleAttractDirection() {
+	g_attract_positive_enabled = !g_attract_positive_enabled;
+	if (g_attract_positive_enabled) {
+		AnnouncePlaceholder(L"吸怪方向：正向");
+		LogEvent("INFO", "attract_direction", "positive");
+		return;
+	}
+	AnnouncePlaceholder(L"吸怪方向：负向");
+	LogEvent("INFO", "attract_direction", "negative");
 }
 
 // 应用配置到运行时变量，避免线程直接读结构体。

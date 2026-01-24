@@ -16,6 +16,7 @@ struct InjectorConfig {
 	std::vector<std::wstring> dll_paths;
 	DWORD scan_interval_ms;
 	DWORD inject_delay_ms;
+	DWORD inject_interval_ms;
 	int max_retries;
 	DWORD retry_interval_ms;
 	DWORD module_check_timeout_ms;
@@ -570,6 +571,7 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	settings.dll_paths.clear();
 	settings.scan_interval_ms = 1000;
 	settings.inject_delay_ms = 3000;
+	settings.inject_interval_ms = 0;
 	settings.max_retries = 5;
 	settings.retry_interval_ms = 2000;
 	settings.module_check_timeout_ms = 8000;
@@ -600,6 +602,7 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 		DWORD detect_interval = ReadIniUInt32(config_path, L"target", L"detect_interval_ms", settings.scan_interval_ms);
 		settings.scan_interval_ms = ReadIniUInt32(config_path, L"target", L"scan_interval_ms", detect_interval);
 		settings.inject_delay_ms = ReadIniUInt32(config_path, L"target", L"inject_delay_ms", settings.inject_delay_ms);
+		settings.inject_interval_ms = ReadIniUInt32(config_path, L"target", L"inject_interval_ms", settings.inject_interval_ms);
 		settings.watch_mode = ParseBool(ReadIniStringValue(config_path, L"target", L"watch_mode", settings.watch_mode ? L"true" : L"false"), settings.watch_mode);
 		settings.exit_when_no_processes = ParseBool(ReadIniStringValue(config_path, L"target", L"exit_when_no_processes", settings.exit_when_no_processes ? L"true" : L"false"), settings.exit_when_no_processes);
 		settings.max_retries = static_cast<int>(ReadIniUInt32(config_path, L"apc", L"max_retries", static_cast<DWORD>(settings.max_retries)));
@@ -1003,6 +1006,10 @@ int wmain(int argc, wchar_t* argv[]) {
 			if (!InjectProcessWithRetries(pid, settings, settings.dll_paths[i], module_names[i], logger, NULL)) {
 				all_injected = false;
 			}
+			if (settings.inject_interval_ms > 0 && i + 1 < settings.dll_paths.size()) {
+				// 不同 DLL 注入之间的间隔。
+				Sleep(settings.inject_interval_ms);
+			}
 		}
 		return all_injected ? 0 : 1;
 	}
@@ -1122,6 +1129,10 @@ int wmain(int argc, wchar_t* argv[]) {
 				}
 				if (!dll_error.empty()) {
 					last_error = dll_error;
+				}
+				if (settings.inject_interval_ms > 0 && i + 1 < pending_indices.size()) {
+					// 不同 DLL 注入之间的间隔。
+					Sleep(settings.inject_interval_ms);
 				}
 			}
 			pid_attempts[pid] = total_attempts;
