@@ -109,6 +109,17 @@ static const DWORD kSummonPositionParam = 0x08AE;
 static const DWORD kSummonDefaultMonsterId = 25301;
 static const DWORD kSummonDefaultLevel = 70;
 static const DWORD kSummonDefaultCooldownMs = 0;
+// 全屏技能模拟调用地址
+static const DWORD kFullscreenSkillCallAddress = 0x00879320;
+// 全屏技能专用偏移（对应 CE 脚本）
+static const DWORD kFullscreenSkillTypeOffset = 0x90;
+static const DWORD kFullscreenSkillPosXOffset = 0x3CE4;
+static const DWORD kFullscreenSkillPosYOffset = 0x3CE8;
+// 全屏技能默认配置
+static const DWORD kFullscreenSkillDefaultCode = 20022;
+static const DWORD kFullscreenSkillDefaultDamage = 13333;
+static const DWORD kFullscreenSkillDefaultIntervalMs = 1000;
+static const DWORD kFullscreenSkillDefaultHotkey = VK_HOME;
 
 // // 0625人物基址
 // static const DWORD kPlayerBaseAddress = 0x01AB7CDC;
@@ -178,6 +189,13 @@ static DWORD g_summon_monster_id = kSummonDefaultMonsterId;
 static DWORD g_summon_level = kSummonDefaultLevel;
 static DWORD g_summon_cooldown_ms = kSummonDefaultCooldownMs;
 static ULONGLONG g_summon_last_tick = 0;
+// 全屏技能运行时状态
+static BOOL g_fullscreen_skill_enabled = FALSE;
+static BOOL g_fullscreen_skill_active = FALSE;
+static DWORD g_fullscreen_skill_code = kFullscreenSkillDefaultCode;
+static DWORD g_fullscreen_skill_damage = kFullscreenSkillDefaultDamage;
+static DWORD g_fullscreen_skill_interval_ms = kFullscreenSkillDefaultIntervalMs;
+static DWORD g_fullscreen_skill_hotkey = kFullscreenSkillDefaultHotkey;
 // 透明线程
 static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
@@ -339,6 +357,11 @@ struct HelperConfig {
 	DWORD summon_monster_id;
 	DWORD summon_level;
 	DWORD summon_cooldown_ms;
+	BOOL enable_fullscreen_skill;
+	DWORD fullscreen_skill_code;
+	DWORD fullscreen_skill_damage;
+	DWORD fullscreen_skill_interval_ms;
+	DWORD fullscreen_skill_hotkey;
 	float monster_x_offset_by_mode[kAttractModeMax + 1];
 	wchar_t output_directory[MAX_PATH];
 	BOOL output_directory_set;
@@ -356,6 +379,11 @@ static HelperConfig GetDefaultHelperConfig() {
 	config.summon_monster_id = kSummonDefaultMonsterId;
 	config.summon_level = kSummonDefaultLevel;
 	config.summon_cooldown_ms = kSummonDefaultCooldownMs;
+	config.enable_fullscreen_skill = TRUE;
+	config.fullscreen_skill_code = kFullscreenSkillDefaultCode;
+	config.fullscreen_skill_damage = kFullscreenSkillDefaultDamage;
+	config.fullscreen_skill_interval_ms = kFullscreenSkillDefaultIntervalMs;
+	config.fullscreen_skill_hotkey = kFullscreenSkillDefaultHotkey;
 	for (int i = 0; i <= kAttractModeMax; ++i) {
 		config.monster_x_offset_by_mode[i] = kDefaultMonsterXOffsetByMode[i];
 	}
@@ -446,6 +474,11 @@ static BOOL LoadHelperConfig(const wchar_t* config_path, HelperConfig* config) {
 	config->summon_monster_id = ReadIniUInt32(config_path, L"feature", L"summon_monster_id", config->summon_monster_id);
 	config->summon_level = ReadIniUInt32(config_path, L"feature", L"summon_level", config->summon_level);
 	config->summon_cooldown_ms = ReadIniUInt32(config_path, L"feature", L"summon_cooldown_ms", config->summon_cooldown_ms);
+	config->enable_fullscreen_skill = ReadIniBool(config_path, L"feature", L"enable_fullscreen_skill", config->enable_fullscreen_skill);
+	config->fullscreen_skill_code = ReadIniUInt32(config_path, L"fullscreen", L"skill_code", config->fullscreen_skill_code);
+	config->fullscreen_skill_damage = ReadIniUInt32(config_path, L"fullscreen", L"skill_damage", config->fullscreen_skill_damage);
+	config->fullscreen_skill_interval_ms = ReadIniUInt32(config_path, L"fullscreen", L"skill_interval", config->fullscreen_skill_interval_ms);
+	config->fullscreen_skill_hotkey = ReadIniUInt32(config_path, L"fullscreen", L"hotkey_vk", config->fullscreen_skill_hotkey);
 	config->monster_x_offset_by_mode[1] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode1", config->monster_x_offset_by_mode[1]);
 	config->monster_x_offset_by_mode[2] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode2", config->monster_x_offset_by_mode[2]);
 	config->monster_x_offset_by_mode[3] = ReadIniFloat(config_path, L"attract", L"monster_x_offset_mode3", config->monster_x_offset_by_mode[3]);
@@ -915,6 +948,116 @@ static void TrySummonDoll() {
 	}
 }
 
+// 全屏技能：按 CE 参数顺序执行模拟 CALL。
+static void CallFullscreenSkill(DWORD x_raw, DWORD y_raw, int z, int damage, int skill_code) {
+	DWORD player_obj = ReadDwordSafely(kPlayerBaseAddress);
+	if (player_obj == 0) {
+		return;
+	}
+	DWORD call_address = kFullscreenSkillCallAddress;
+	__asm {
+		pushad
+		push 0
+		push 0
+		push 0
+		push 0
+		push 0
+		push 0
+		push 4
+		push 0
+		push 0
+		push z
+		push y_raw
+		push x_raw
+		push damage
+		push skill_code
+		push player_obj
+		mov ecx, player_obj
+		mov eax, call_address
+		call eax
+		popad
+	}
+}
+
+// 全屏技能遍历线程：遍历地图单位并执行技能。
+static DWORD WINAPI FullscreenSkillThread(LPVOID param) {
+	UNREFERENCED_PARAMETER(param);
+	while (TRUE) {
+		if (!g_fullscreen_skill_enabled) {
+			Sleep(1000);
+			continue;
+		}
+		if (!g_fullscreen_skill_active) {
+			Sleep(200);
+			continue;
+		}
+		DWORD player_ptr = ReadDwordSafely(kPlayerBaseAddress);
+		if (player_ptr == 0) {
+			Sleep(1000);
+			continue;
+		}
+		DWORD map_ptr = ReadDwordSafely(player_ptr + kMapOffset);
+		if (map_ptr == 0) {
+			Sleep(500);
+			continue;
+		}
+		DWORD start_ptr = ReadDwordSafely(map_ptr + kMapStartOffset);
+		DWORD end_ptr = ReadDwordSafely(map_ptr + kMapEndOffset);
+		if (start_ptr == 0 || end_ptr == 0 || end_ptr <= start_ptr || end_ptr < 4) {
+			Sleep(200);
+			continue;
+		}
+		DWORD last_ptr = end_ptr - 4;
+		int count = (int)((end_ptr - start_ptr) / 4);
+		if (count <= 0 || count > kMaxObjectCount) {
+			Sleep(200);
+			continue;
+		}
+		for (DWORD cursor = start_ptr; cursor <= last_ptr; cursor += 4) {
+			DWORD object_ptr = ReadDwordSafely(cursor);
+			if (object_ptr == 0) {
+				continue;
+			}
+			int faction = (int)ReadDwordSafely(object_ptr + kFactionOffset);
+			if (faction == 0) {
+				continue;
+			}
+			int type = (int)ReadDwordSafely(object_ptr + kFullscreenSkillTypeOffset);
+			if (type != kTypeMonster && type != kTypeApc) {
+				continue;
+			}
+			DWORD x_raw = ReadDwordSafely(object_ptr + kFullscreenSkillPosXOffset);
+			DWORD y_raw = ReadDwordSafely(object_ptr + kFullscreenSkillPosYOffset);
+			CallFullscreenSkill(x_raw, y_raw, 0,
+				static_cast<int>(g_fullscreen_skill_damage),
+				static_cast<int>(g_fullscreen_skill_code));
+		}
+		DWORD interval = g_fullscreen_skill_interval_ms;
+		if (interval == 0) {
+			interval = 1;
+		}
+		Sleep(interval);
+	}
+	return 0;
+}
+
+// 全屏技能开关切换。
+static void ToggleFullscreenSkill() {
+	if (!g_fullscreen_skill_enabled) {
+		AnnouncePlaceholder(L"全屏技能未启用");
+		LogEvent("INFO", "fullscreen_skill", "disabled_by_config");
+		return;
+	}
+	g_fullscreen_skill_active = !g_fullscreen_skill_active;
+	if (g_fullscreen_skill_active) {
+		AnnouncePlaceholder(L"全屏技能 [开启]");
+		LogEvent("INFO", "fullscreen_skill", "activated");
+	} else {
+		AnnouncePlaceholder(L"全屏技能 [关闭]");
+		LogEvent("INFO", "fullscreen_skill", "deactivated");
+	}
+}
+
 // 前台窗口输入轮询：仅当前进程前台时响应按键，避免多开冲突。
 static void ToggleAutoTransparent();
 static void ToggleAttractMode(int mode, const wchar_t* message);
@@ -931,6 +1074,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 	bool key9_last_down = false;
 	bool key0_last_down = false;
 	bool minus_last_down = false;
+	bool fullscreen_hotkey_last_down = false;
 	while (TRUE) {
 		HWND foreground = GetForegroundWindow();
 		DWORD foreground_pid = 0;
@@ -946,6 +1090,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			SHORT key9_state = GetAsyncKeyState('9');
 			SHORT key0_state = GetAsyncKeyState('0');
 			SHORT minus_state = GetAsyncKeyState(VK_OEM_MINUS);
+			SHORT fullscreen_state = 0;
 			bool f2_down = (f2_state & 0x8000) != 0;
 			bool f3_down = (f3_state & 0x8000) != 0;
 			bool f12_down = (f12_state & 0x8000) != 0;
@@ -954,6 +1099,11 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			bool key9_down = (key9_state & 0x8000) != 0;
 			bool key0_down = (key0_state & 0x8000) != 0;
 			bool minus_down = (minus_state & 0x8000) != 0;
+			bool fullscreen_down = false;
+			if (g_fullscreen_skill_hotkey != 0) {
+				fullscreen_state = GetAsyncKeyState(static_cast<int>(g_fullscreen_skill_hotkey));
+				fullscreen_down = (fullscreen_state & 0x8000) != 0;
+			}
 			if (f2_down && !f2_last_down) {
 				ToggleAutoTransparent();
 			}
@@ -978,6 +1128,9 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			if (minus_down && !minus_last_down) {
 				ToggleAttractDirection();
 			}
+			if (fullscreen_down && !fullscreen_hotkey_last_down) {
+				ToggleFullscreenSkill();
+			}
 			f2_last_down = f2_down;
 			f3_last_down = f3_down;
 			f12_last_down = f12_down;
@@ -986,6 +1139,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			key9_last_down = key9_down;
 			key0_last_down = key0_down;
 			minus_last_down = minus_down;
+			fullscreen_hotkey_last_down = fullscreen_down;
 		} else {
 			f2_last_down = false;
 			f3_last_down = false;
@@ -995,6 +1149,7 @@ static DWORD WINAPI InputPollThread(LPVOID param) {
 			key9_last_down = false;
 			key0_last_down = false;
 			minus_last_down = false;
+			fullscreen_hotkey_last_down = false;
 		}
 		Sleep(kInputPollIntervalMs);
 	}
@@ -1173,6 +1328,12 @@ static void ApplyRuntimeConfig(const HelperConfig& config) {
 	g_summon_level = config.summon_level;
 	g_summon_cooldown_ms = config.summon_cooldown_ms;
 	g_summon_last_tick = 0;
+	g_fullscreen_skill_enabled = config.enable_fullscreen_skill;
+	g_fullscreen_skill_code = config.fullscreen_skill_code;
+	g_fullscreen_skill_damage = config.fullscreen_skill_damage;
+	g_fullscreen_skill_interval_ms = config.fullscreen_skill_interval_ms;
+	g_fullscreen_skill_hotkey = config.fullscreen_skill_hotkey;
+	g_fullscreen_skill_active = FALSE;
 	for (int i = 0; i <= kAttractModeMax; ++i) {
 		g_monster_x_offset_by_mode[i] = config.monster_x_offset_by_mode[i];
 	}
@@ -1248,6 +1409,18 @@ static void InitializeHelper(const wchar_t* output_directory, const HelperConfig
 		} else {
 			LogEventWithError("attract_thread", "create_failed", GetLastError());
 		}
+	}
+
+	if (config.enable_fullscreen_skill) {
+		HANDLE fullscreen_thread = CreateThread(NULL, 0, FullscreenSkillThread, NULL, 0, NULL);
+		if (fullscreen_thread != NULL) {
+			CloseHandle(fullscreen_thread);
+			LogEvent("INFO", "fullscreen_skill_thread", "started");
+		} else {
+			LogEventWithError("fullscreen_skill_thread", "create_failed", GetLastError());
+		}
+	} else {
+		LogEvent("INFO", "fullscreen_skill_thread", "disabled_by_config");
 	}
 }
 
@@ -1333,6 +1506,18 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 		config.summon_level,
 		config.summon_cooldown_ms);
 	LogEvent("INFO", "config_summon", summon_message);
+
+	char fullscreen_message[200] = {0};
+	sprintf_s(
+		fullscreen_message,
+		sizeof(fullscreen_message),
+		"enable_fullscreen_skill=%d skill_code=%lu skill_damage=%lu skill_interval_ms=%lu hotkey_vk=0x%02lX",
+		config.enable_fullscreen_skill,
+		config.fullscreen_skill_code,
+		config.fullscreen_skill_damage,
+		config.fullscreen_skill_interval_ms,
+		config.fullscreen_skill_hotkey);
+	LogEvent("INFO", "config_fullscreen", fullscreen_message);
 
 	char attract_message[200] = {0};
 	sprintf_s(
