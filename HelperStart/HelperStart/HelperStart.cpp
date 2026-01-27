@@ -27,6 +27,8 @@ struct InjectorConfig {
 	std::wstring success_file_name;
 	bool watch_mode;
 	bool exit_when_no_processes;
+	bool launch_gui;
+	std::wstring gui_path;
 	std::wstring log_path;
 	std::string log_level;
 	bool log_pid_list;
@@ -68,6 +70,15 @@ static std::wstring GetExeDirectory() {
 		return L"";
 	}
 	*(last_slash + 1) = L'\0';
+	return buffer;
+}
+
+static std::wstring GetExePath() {
+	wchar_t buffer[MAX_PATH] = {0};
+	DWORD length = GetModuleFileNameW(NULL, buffer, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH) {
+		return L"";
+	}
 	return buffer;
 }
 
@@ -164,6 +175,31 @@ static std::wstring GetBaseNameWithoutExtension(const std::wstring& path) {
 		return base_name;
 	}
 	return base_name.substr(0, dot);
+}
+
+static std::wstring ToUpperWide(const std::wstring& input) {
+	std::wstring output = input;
+	for (size_t i = 0; i < output.size(); ++i) {
+		output[i] = static_cast<wchar_t>(towupper(output[i]));
+	}
+	return output;
+}
+
+static bool ContainsSubstringInsensitive(const std::wstring& input, const std::wstring& token) {
+	if (token.empty()) {
+		return false;
+	}
+	std::wstring upper_input = ToUpperWide(input);
+	std::wstring upper_token = ToUpperWide(token);
+	return upper_input.find(upper_token) != std::wstring::npos;
+}
+
+static bool IsGuiLaunchDefaultEnabled(const std::wstring& exe_path) {
+	std::wstring base_name = GetBaseNameWithoutExtension(exe_path);
+	if (base_name.empty()) {
+		return false;
+	}
+	return ContainsSubstringInsensitive(base_name, L"_GUI");
 }
 
 static std::wstring TrimWide(const std::wstring& input) {
@@ -563,7 +599,10 @@ static void DeleteSuccessFilesForPid(const InjectorConfig& settings,
 	}
 }
 
-static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const std::wstring& exe_dir, bool* loaded) {
+static InjectorConfig LoadInjectorConfig(const std::wstring& config_path,
+	const std::wstring& exe_dir,
+	bool default_launch_gui,
+	bool* loaded) {
 	// 读取 INI 配置，缺省值直接生效
 	InjectorConfig settings;
 	settings.process_name = L"dnf.exe";
@@ -582,6 +621,8 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 	settings.success_file_name = L"successfile_%dll.name%_%pid%.txt";
 	settings.watch_mode = true;
 	settings.exit_when_no_processes = false;
+	settings.launch_gui = default_launch_gui;
+	settings.gui_path = L"GameHelperGUI.exe";
 	settings.log_path = L"injector.jsonl";
 	settings.log_level = "INFO";
 	settings.log_pid_list = false;
@@ -627,6 +668,20 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 		settings.log_pid_list = ParseBool(ReadIniStringValue(config_path, L"log", L"log_pid_list", L"false"), settings.log_pid_list);
 		settings.console_output = ParseBool(ReadIniStringValue(config_path, L"log", L"console_output", L"true"), true);
 		settings.file_output = ParseBool(ReadIniStringValue(config_path, L"log", L"file_output", L"true"), true);
+		std::wstring gui_launch_value = ReadIniStringValue(
+			config_path,
+			L"gui",
+			L"launch_gui",
+			settings.launch_gui ? L"true" : L"false");
+		settings.launch_gui = ParseBool(gui_launch_value, settings.launch_gui);
+		std::wstring gui_path_value = TrimWide(ReadIniStringValue(
+			config_path,
+			L"gui",
+			L"gui_path",
+			settings.gui_path.c_str()));
+		if (!gui_path_value.empty()) {
+			settings.gui_path = gui_path_value;
+		}
 	}
 
 	// DLL 列表优先：dll_paths -> dll_path -> 默认 GameHelper.dll
@@ -645,6 +700,60 @@ static InjectorConfig LoadInjectorConfig(const std::wstring& config_path, const 
 		settings.log_path = JoinPathSafe(exe_dir, settings.log_path);
 	}
 	return settings;
+}
+
+static bool LaunchGuiProcess(const InjectorConfig& settings,
+	const std::wstring& exe_dir,
+	JsonLogger& logger,
+	const LogExtras& base_extras) {
+	if (!settings.launch_gui) {
+		logger.Log("INFO", "gui_launch", "disabled", base_extras);
+		return false;
+	}
+	if (settings.gui_path.empty()) {
+		logger.Log("WARN", "gui_launch", "path_empty", base_extras);
+		return false;
+	}
+	std::wstring gui_path = NormalizePath(settings.gui_path, exe_dir);
+	DWORD attrs = GetFileAttributesW(gui_path.c_str());
+	if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+		LogExtras extras = base_extras;
+		extras.error_code = GetLastError();
+		std::string message = "path_invalid ";
+		message += WideToUtf8(gui_path);
+		logger.Log("WARN", "gui_launch", message, extras);
+		return false;
+	}
+	STARTUPINFOW startup = {0};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process_info = {0};
+	std::wstring command_line = L"\"" + gui_path + L"\"";
+	std::wstring work_dir = GetDirectoryPath(gui_path);
+	BOOL ok = CreateProcessW(
+		NULL,
+		&command_line[0],
+		NULL,
+		NULL,
+		FALSE,
+		0,
+		NULL,
+		work_dir.empty() ? NULL : work_dir.c_str(),
+		&startup,
+		&process_info);
+	if (!ok) {
+		LogExtras extras = base_extras;
+		extras.error_code = GetLastError();
+		std::string message = "create_failed ";
+		message += WideToUtf8(gui_path);
+		logger.Log("WARN", "gui_launch", message, extras);
+		return false;
+	}
+	CloseHandle(process_info.hProcess);
+	CloseHandle(process_info.hThread);
+	std::string message = "started ";
+	message += WideToUtf8(gui_path);
+	logger.Log("INFO", "gui_launch", message, base_extras);
+	return true;
 }
 
 static DWORD FindProcessIdByName(const std::wstring& process_name) {
@@ -935,6 +1044,7 @@ static bool InjectProcessWithRetries(DWORD pid, const InjectorConfig& settings, 
 
 int wmain(int argc, wchar_t* argv[]) {
 	// 注入器入口：加载配置 -> 等待进程 -> 执行注入
+	std::wstring exe_path = GetExePath();
 	std::wstring exe_dir = GetExeDirectory();
 	std::wstring config_path = JoinPathSafe(exe_dir, L"injector.ini");
 	if (argc >= 3 && _wcsicmp(argv[1], L"--config") == 0) {
@@ -942,7 +1052,8 @@ int wmain(int argc, wchar_t* argv[]) {
 	}
 
 	bool config_loaded = false;
-	InjectorConfig settings = LoadInjectorConfig(config_path, exe_dir, &config_loaded);
+	bool default_launch_gui = IsGuiLaunchDefaultEnabled(exe_path);
+	InjectorConfig settings = LoadInjectorConfig(config_path, exe_dir, default_launch_gui, &config_loaded);
 	JsonLogger logger;
 	logger.Initialize(settings, exe_dir);
 
@@ -951,6 +1062,8 @@ int wmain(int argc, wchar_t* argv[]) {
 	extras.dll_path = settings.dll_path;
 
 	logger.Log("INFO", "startup", config_loaded ? "config_loaded" : "config_default", extras);
+
+	LaunchGuiProcess(settings, exe_dir, logger, extras);
 
 	if (settings.process_name.empty()) {
 		logger.Log("ERROR", "config", "process_name_empty", extras);
