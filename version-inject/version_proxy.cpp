@@ -143,6 +143,9 @@ static const BYTE kFullscreenAttackPatchOffB[kFullscreenAttackPatchSize] = {0x32
 // 全屏攻击补丁开启
 static const BYTE kFullscreenAttackPatchOn[kFullscreenAttackPatchSize] = {0xB0, 0x01};
 
+// 全屏攻击轮询间隔默认值
+static const DWORD kFullscreenAttackPollIntervalMs = 1000;
+
 // 输入轮询间隔
 static const DWORD kInputPollIntervalMs = 30;
 
@@ -201,6 +204,9 @@ static HANDLE g_transparent_thread = NULL;
 static BOOL g_character_transparent = FALSE;
 static BYTE g_fullscreen_attack_off_patch[kFullscreenAttackPatchSize] = {0};
 static BOOL g_fullscreen_attack_off_patch_set = FALSE;
+// 全屏攻击目标状态与轮询间隔
+static volatile LONG g_fullscreen_attack_target_enabled = 0;
+static DWORD g_fullscreen_attack_poll_interval_ms = kFullscreenAttackPollIntervalMs;
 static const wchar_t kLogFileName[] = L"game_helper.jsonl";
 static const wchar_t kConfigFileName[] = L"game_helper.ini";
 static HMODULE g_self_module = NULL;
@@ -349,6 +355,7 @@ static BOOL BuildSuccessFilePath(const wchar_t* directory_path,
 struct HelperConfig {
 	DWORD startup_delay_ms;
 	BOOL apply_fullscreen_attack_patch;
+	DWORD fullscreen_attack_poll_interval_ms;
 	BOOL safe_mode;
 	BOOL wipe_pe_header;
 	BOOL disable_input_thread;
@@ -371,6 +378,7 @@ static HelperConfig GetDefaultHelperConfig() {
 	HelperConfig config = {0};
 	config.startup_delay_ms = 0;
 	config.apply_fullscreen_attack_patch = FALSE;
+	config.fullscreen_attack_poll_interval_ms = kFullscreenAttackPollIntervalMs;
 	config.safe_mode = FALSE;
 	config.wipe_pe_header = TRUE;
 	config.disable_input_thread = FALSE;
@@ -467,6 +475,7 @@ static BOOL LoadHelperConfig(const wchar_t* config_path, HelperConfig* config) {
 	config->startup_delay_ms = ReadIniUInt32(config_path, L"startup", L"startup_delay_ms", config->startup_delay_ms);
 	config->safe_mode = ReadIniBool(config_path, L"startup", L"safe_mode", config->safe_mode);
 	config->apply_fullscreen_attack_patch = ReadIniBool(config_path, L"patch", L"apply_fullscreen_attack_patch", config->apply_fullscreen_attack_patch);
+	config->fullscreen_attack_poll_interval_ms = ReadIniUInt32(config_path, L"patch", L"fullscreen_attack_poll_interval_ms", config->fullscreen_attack_poll_interval_ms);
 	config->wipe_pe_header = ReadIniBool(config_path, L"stealth", L"wipe_pe_header", config->wipe_pe_header);
 	config->disable_input_thread = ReadIniBool(config_path, L"feature", L"disable_input_thread", config->disable_input_thread);
 	config->disable_attract_thread = ReadIniBool(config_path, L"feature", L"disable_attract_thread", config->disable_attract_thread);
@@ -787,32 +796,44 @@ static BOOL SetFullscreenAttackEnabled(BOOL enabled) {
 	return WriteBytesSafely(kFullScreenAttackPatchAddress, off_patch, kFullscreenAttackPatchSize);
 }
 
+// 读取全屏攻击目标状态，避免多线程竞态。
+static BOOL IsFullscreenAttackTargetEnabled() {
+	return InterlockedCompareExchange(&g_fullscreen_attack_target_enabled, 0, 0) != 0;
+}
+
+// 设置全屏攻击目标状态，供轮询线程纠偏。
+static void SetFullscreenAttackTargetEnabled(BOOL enabled) {
+	InterlockedExchange(&g_fullscreen_attack_target_enabled, enabled ? 1 : 0);
+}
+
 static void ToggleFullscreenAttack() {
-	BYTE current[2] = {0};
-	if (!ReadBytesSafely(kFullScreenAttackPatchAddress, current, sizeof(current))) {
-		LogEvent("WARN", "fullscreen_attack", "read_failed");
-		return;
+	BOOL next_enabled = IsFullscreenAttackTargetEnabled() ? FALSE : TRUE;
+	SetFullscreenAttackTargetEnabled(next_enabled);
+	if (next_enabled) {
+		AnnouncePlaceholder(L"全屏攻击目标 [开启]");
+		LogEvent("INFO", "fullscreen_attack", "target_enabled");
+	} else {
+		AnnouncePlaceholder(L"全屏攻击目标 [关闭]");
+		LogEvent("INFO", "fullscreen_attack", "target_disabled");
 	}
-	RememberFullscreenAttackOffBytes(current);
-	if (IsFullscreenAttackOffBytes(current)) {
-		if (SetFullscreenAttackEnabled(TRUE)) {
-			AnnouncePlaceholder(L"开启全屏攻击");
-			LogEvent("INFO", "fullscreen_attack", "enabled");
-		} else {
-			LogEvent("WARN", "fullscreen_attack", "enable_failed");
+	if (!SetFullscreenAttackEnabled(next_enabled)) {
+		LogEvent("WARN", "fullscreen_attack", "apply_failed");
+	}
+}
+
+// 全屏攻击状态轮询：与目标状态不一致时纠正。
+static DWORD WINAPI FullscreenAttackGuardThread(LPVOID param) {
+	UNREFERENCED_PARAMETER(param);
+	while (TRUE) {
+		BOOL target_enabled = IsFullscreenAttackTargetEnabled();
+		SetFullscreenAttackEnabled(target_enabled);
+		DWORD interval = g_fullscreen_attack_poll_interval_ms;
+		if (interval == 0) {
+			interval = 1;
 		}
-		return;
+		Sleep(interval);
 	}
-	if (memcmp(current, kFullscreenAttackPatchOn, kFullscreenAttackPatchSize) == 0) {
-		if (SetFullscreenAttackEnabled(FALSE)) {
-			AnnouncePlaceholder(L"关闭全屏攻击");
-			LogEvent("INFO", "fullscreen_attack", "disabled");
-		} else {
-			LogEvent("WARN", "fullscreen_attack", "disable_failed");
-		}
-		return;
-	}
-	LogEvent("WARN", "fullscreen_attack", "state_unknown");
+	return 0;
 }
 
 // 吸怪聚物：根据配置把怪物/物品坐标拉到人物坐标或偏移位置。
@@ -1323,6 +1344,9 @@ static void ToggleAttractDirection() {
 
 // 应用配置到运行时变量，避免线程直接读结构体。
 static void ApplyRuntimeConfig(const HelperConfig& config) {
+	// 全屏攻击默认关闭，由轮询线程维持目标状态。
+	SetFullscreenAttackTargetEnabled(FALSE);
+	g_fullscreen_attack_poll_interval_ms = config.fullscreen_attack_poll_interval_ms;
 	g_summon_enabled = config.enable_summon_doll;
 	g_summon_monster_id = config.summon_monster_id;
 	g_summon_level = config.summon_level;
@@ -1370,21 +1394,25 @@ static void InitializeHelper(const wchar_t* output_directory, const HelperConfig
 		LogEvent("WARN", "success_file", "output_directory_missing");
 	}
 
+	if (SetFullscreenAttackEnabled(FALSE)) {
+		LogEvent("INFO", "fullscreen_attack", "default_off");
+	} else {
+		LogEvent("WARN", "fullscreen_attack", "default_off_failed");
+	}
+
+	HANDLE fullscreen_attack_thread = CreateThread(NULL, 0, FullscreenAttackGuardThread, NULL, 0, NULL);
+	if (fullscreen_attack_thread != NULL) {
+		CloseHandle(fullscreen_attack_thread);
+		LogEvent("INFO", "fullscreen_attack_thread", "started");
+	} else {
+		LogEventWithError("fullscreen_attack_thread", "create_failed", GetLastError());
+	}
+
 	if (config.startup_delay_ms > 0) {
 		char delay_message[64] = {0};
 		sprintf_s(delay_message, sizeof(delay_message), "delay_ms=%lu", config.startup_delay_ms);
 		LogEvent("INFO", "startup_delay", delay_message);
 		Sleep(config.startup_delay_ms);
-	}
-
-	if (config.apply_fullscreen_attack_patch) {
-		if (SetFullscreenAttackEnabled(FALSE)) {
-			LogEvent("INFO", "fullscreen_attack", "reset_ok");
-		} else {
-			LogEvent("WARN", "fullscreen_attack", "reset_failed");
-		}
-	} else {
-		LogEvent("INFO", "fullscreen_attack", "skip_by_config");
 	}
 
 	if (config.disable_input_thread) {
@@ -1483,17 +1511,18 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 		LogEventWithPath("output_dir_invalid", config.output_directory);
 	}
 
-	char config_message[160] = {0};
+	char config_message[220] = {0};
 	sprintf_s(
 		config_message,
 		sizeof(config_message),
-		"startup_delay_ms=%lu apply_fullscreen_attack_patch=%d safe_mode=%d wipe_pe_header=%d disable_input_thread=%d disable_attract_thread=%d",
+		"startup_delay_ms=%lu fullscreen_attack_poll_interval_ms=%lu safe_mode=%d wipe_pe_header=%d disable_input_thread=%d disable_attract_thread=%d apply_fullscreen_attack_patch_ignored=%d",
 		config.startup_delay_ms,
-		config.apply_fullscreen_attack_patch,
+		config.fullscreen_attack_poll_interval_ms,
 		config.safe_mode,
 		config.wipe_pe_header,
 		config.disable_input_thread,
-		config.disable_attract_thread);
+		config.disable_attract_thread,
+		config.apply_fullscreen_attack_patch);
 	LogEvent("INFO", "config_effective", config_message);
 
 	char summon_message[160] = {0};
