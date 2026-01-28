@@ -1,0 +1,224 @@
+{
+  "sections": [
+    {
+      "name": "startup",
+      "title": "启动参数",
+      "items": [
+        {
+          "key": "startup_delay_ms",
+          "label": "启动延迟(ms)",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 60000,
+          "desc": "启动后延迟执行初始化"
+        },
+        {
+          "key": "safe_mode",
+          "label": "安全模式",
+          "type": "bool",
+          "default": false,
+          "desc": "启用后跳过核心功能"
+        }
+      ]
+    },
+    {
+      "name": "patch",
+      "title": "补丁参数",
+      "items": [
+        {
+          "key": "apply_fullscreen_attack_patch",
+          "label": "全屏攻击补丁开关(已忽略)",
+          "type": "bool",
+          "default": false,
+          "desc": "该项已被忽略，仅保留兼容"
+        },
+        {
+          "key": "fullscreen_attack_poll_interval_ms",
+          "label": "全屏攻击纠偏间隔(ms)",
+          "type": "int",
+          "default": 1000,
+          "min": 1,
+          "max": 5000,
+          "desc": "状态纠偏轮询间隔"
+        }
+      ]
+    },
+    {
+      "name": "feature",
+      "title": "功能开关",
+      "items": [
+        {
+          "key": "disable_input_thread",
+          "label": "禁用输入线程",
+          "type": "bool",
+          "default": false,
+          "desc": "禁用热键输入监听"
+        },
+        {
+          "key": "disable_attract_thread",
+          "label": "禁用吸怪线程",
+          "type": "bool",
+          "default": false,
+          "desc": "禁用自动吸怪执行"
+        },
+        {
+          "key": "enable_summon_doll",
+          "label": "启用召唤人偶",
+          "type": "bool",
+          "default": true,
+          "desc": "启用召唤人偶功能"
+        },
+        {
+          "key": "summon_monster_id",
+          "label": "人偶怪物ID",
+          "type": "int",
+          "default": 25301,
+          "desc": "召唤人偶ID"
+        },
+        {
+          "key": "summon_level",
+          "label": "人偶等级",
+          "type": "int",
+          "default": 70,
+          "desc": "召唤人偶等级"
+        },
+        {
+          "key": "summon_cooldown_ms",
+          "label": "人偶冷却(ms)",
+          "type": "int",
+          "default": 0,
+          "desc": "召唤冷却时间"
+        },
+        {
+          "key": "enable_fullscreen_skill",
+          "label": "启用全屏技能",
+          "type": "bool",
+          "default": true,
+          "desc": "启用全屏技能线程"
+        }
+      ]
+    },
+    {
+      "name": "fullscreen",
+      "title": "全屏技能",
+      "items": [
+        {
+          "key": "skill_code",
+          "label": "技能编号",
+          "type": "int",
+          "default": 20022,
+          "desc": "全屏技能编号"
+        },
+        {
+          "key": "skill_damage",
+          "label": "技能伤害",
+          "type": "int",
+          "default": 13333,
+          "desc": "全屏技能伤害"
+        },
+        {
+          "key": "skill_interval",
+          "label": "技能间隔(ms)",
+          "type": "int",
+          "default": 1000,
+          "desc": "全屏技能执行间隔"
+        },
+        {
+          "key": "hotkey_vk",
+          "label": "技能热键(VK)",
+          "type": "int",
+          "default": 36,
+          "desc": "全屏技能热键 VK 值"
+        }
+      ]
+    },
+    {
+      "name": "attract",
+      "title": "吸怪参数",
+      "items": [
+        {
+          "key": "monster_x_offset_mode1",
+          "label": "吸怪偏移1",
+          "type": "float",
+          "default": 0.0,
+          "desc": "吸怪偏移配置1"
+        },
+        {
+          "key": "monster_x_offset_mode2",
+          "label": "吸怪偏移2",
+          "type": "float",
+          "default": 80.0,
+          "desc": "吸怪偏移配置2"
+        },
+        {
+          "key": "monster_x_offset_mode3",
+          "label": "吸怪偏移3",
+          "type": "float",
+          "default": 150.0,
+          "desc": "吸怪偏移配置3"
+        },
+        {
+          "key": "monster_x_offset_mode4",
+          "label": "吸怪偏移4",
+          "type": "float",
+          "default": 250.0,
+          "desc": "吸怪偏移配置4"
+        }
+      ]
+    },
+    {
+      "name": "stealth",
+      "title": "隐藏配置",
+      "items": [
+        {
+          "key": "wipe_pe_header",
+          "label": "抹除PE头",
+          "type": "bool",
+          "default": true,
+          "desc": "加载后抹除模块头"
+        }
+      ]
+    },
+    {
+      "name": "output",
+      "title": "输出路径",
+      "items": [
+        {
+          "key": "output_dir",
+          "label": "输出目录",
+          "type": "string",
+          "default": "",
+          "desc": "成功文件输出目录"
+        }
+      ]
+    },
+    {
+      "name": "gui_log",
+      "title": "GUI 日志",
+      "items": [
+        {
+          "key": "log_level",
+          "label": "日志等级",
+          "type": "string",
+          "default": "INFO",
+          "desc": "DEBUG/INFO/WARN/ERROR"
+        },
+        {
+          "key": "log_path",
+          "label": "日志文件",
+          "type": "string",
+          "default": "gui.log.jsonl",
+          "desc": "相对路径基于 GUI 目录"
+        },
+        {
+          "key": "console_output",
+          "label": "控制台输出",
+          "type": "bool",
+          "default": false,
+          "desc": "是否输出到控制台"
+        }
+      ]
+    }
+  ]
+}
